@@ -99,7 +99,7 @@ pub trait Transaction {
     /// EIP-8141 frame transaction context, or `None` when this is not a frame
     /// transaction. Defaults to `None` so existing transaction types are
     /// unaffected; the frame opcodes then halt, as the spec requires.
-    fn frame_tx_context(&self) -> Option<&crate::host::FrameTxContext> {
+    fn frame_tx_context(&self) -> Option<crate::host::FrameTxContext> {
         None
     }
 

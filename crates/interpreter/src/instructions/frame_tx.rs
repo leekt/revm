@@ -76,7 +76,7 @@ pub fn approve<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
 /// Reads a transaction-scoped parameter. An undefined parameter halts.
 pub fn txparam<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
     gas!(context.interpreter, gas::BASE);
-    let Some(frame) = context.host.frame_context().cloned() else {
+    let Some(frame) = context.host.frame_context() else {
         return Err(InstructionResult::InvalidFEOpcode);
     };
     popn_top!([], param, context.interpreter);
@@ -108,7 +108,7 @@ pub fn txparam<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
 /// end of the data.
 pub fn framedataload<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
     gas!(context.interpreter, gas::VERYLOW);
-    let Some(frame) = context.host.frame_context().cloned() else {
+    let Some(frame) = context.host.frame_context() else {
         return Err(InstructionResult::InvalidFEOpcode);
     };
     popn_top!([offset], frame_index, context.interpreter);
@@ -131,7 +131,7 @@ pub fn framedataload<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Res
 /// Copies from the chosen frame's calldata into memory, zero-extending beyond
 /// the end of the data. Priced exactly as CALLDATACOPY.
 pub fn framedatacopy<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
-    let Some(frame) = context.host.frame_context().cloned() else {
+    let Some(frame) = context.host.frame_context() else {
         return Err(InstructionResult::InvalidFEOpcode);
     };
     popn!(
@@ -165,7 +165,7 @@ pub fn framedatacopy<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Res
 /// does not exist yet and halts.
 pub fn frameparam<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
     gas!(context.interpreter, gas::BASE);
-    let Some(frame) = context.host.frame_context().cloned() else {
+    let Some(frame) = context.host.frame_context() else {
         return Err(InstructionResult::InvalidFEOpcode);
     };
     // frameIndex is on top, param second; the result replaces param.
@@ -210,7 +210,7 @@ pub fn frameparam<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result
 /// requirement is checked here -- without this, the copy form would read below
 /// the stack.
 pub fn sigparam<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
-    let Some(frame) = context.host.frame_context().cloned() else {
+    let Some(frame) = context.host.frame_context() else {
         return Err(InstructionResult::InvalidFEOpcode);
     };
     // Inspect the param before consuming anything: its value decides how many
