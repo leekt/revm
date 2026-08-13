@@ -733,12 +733,14 @@ mod tests {
         for _ in OPCODE_INFO.into_iter().flatten() {
             opcode_num += 1;
         }
-        assert_eq!(opcode_num, 154);
+        // 154 upstream, plus the six EIP-8141 frame transaction opcodes.
+        assert_eq!(opcode_num, 160);
     }
 
     #[test]
     fn test_terminating_opcodes() {
-        let terminating = [REVERT, RETURN, INVALID, SELFDESTRUCT, STOP];
+        // APPROVE exits the frame successfully, like RETURN.
+        let terminating = [REVERT, RETURN, INVALID, SELFDESTRUCT, STOP, APPROVE];
         let mut opcodes = [false; 256];
         for terminating in terminating.iter() {
             opcodes[*terminating as usize] = true;
