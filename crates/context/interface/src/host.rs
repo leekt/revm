@@ -27,6 +27,7 @@ pub enum LoadError {
 /// from this context; outside a frame transaction it is absent and those opcodes
 /// halt exceptionally.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FrameTxContext {
     /// The declared sender of the transaction.
     pub sender: Address,
@@ -50,10 +51,16 @@ pub struct FrameTxContext {
     pub frames: Vec<FrameInfo>,
     /// Every signature entry in the transaction, in order.
     pub signatures: Vec<FrameSigInfo>,
+    /// Scopes `APPROVE` is permitted to grant, mirroring `frame.flags & 0x3`.
+    pub approvable_scopes: u64,
+    /// Scope `APPROVE` actually granted, or 0. Lets a caller assert what was
+    /// approved rather than only that the frame did not revert.
+    pub approved_scope: u64,
 }
 
 /// A single frame within a frame transaction, as seen by `FRAMEPARAM`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FrameInfo {
     /// Target after resolving a null target to `tx.sender`.
     pub resolved_target: Address,
@@ -74,6 +81,7 @@ pub struct FrameInfo {
 
 /// A signature entry, as seen by `SIGPARAM`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FrameSigInfo {
     /// Signer after resolving an absent signer to `tx.sender`. `None` for
     /// `ARBITRARY` entries, which have no protocol-assigned signer.

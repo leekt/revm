@@ -489,6 +489,21 @@ impl<
 
     /* Transaction */
 
+    /* EIP-8141 frame transaction */
+
+    fn frame_context(&self) -> Option<&context_interface::host::FrameTxContext> {
+        self.tx().frame_tx_context()
+    }
+
+    fn frame_approve(&mut self, scope: u64) -> bool {
+        let Some(frame) = self.tx().frame_tx_context() else {
+            return false;
+        };
+        // The requested scope must be a non-empty subset of what the frame's
+        // flags permit, exactly as the spec requires of APPROVE.
+        scope != 0 && scope & !frame.approvable_scopes == 0
+    }
+
     fn effective_gas_price(&self) -> U256 {
         let basefee = self.block().basefee();
         U256::from(self.tx().effective_gas_price(basefee as u128))
