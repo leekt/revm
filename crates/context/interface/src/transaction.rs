@@ -96,6 +96,13 @@ pub trait Transaction {
     /// Note : EIP-4844 transaction field.
     fn blob_versioned_hashes(&self) -> &[B256];
 
+    /// EIP-8141 frame transaction context, or `None` when this is not a frame
+    /// transaction. Defaults to `None` so existing transaction types are
+    /// unaffected; the frame opcodes then halt, as the spec requires.
+    fn frame_tx_context(&self) -> Option<&crate::host::FrameTxContext> {
+        None
+    }
+
     /// Max fee per data gas
     ///
     /// Note : EIP-4844 transaction field.
