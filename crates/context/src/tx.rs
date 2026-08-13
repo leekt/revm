@@ -86,9 +86,6 @@ pub struct TxEnv {
     ///
     /// [EIP-7702]: https://eips.ethereum.org/EIPS/eip-7702
     pub authorization_list: Vec<Either<SignedAuthorization, RecoveredAuthorization>>,
-    /// EIP-8141 frame transaction context. `None` for every other transaction
-    /// type, which makes the frame opcodes halt as the spec requires.
-    pub frame_tx: Option<context_interface::host::FrameTxContext>,
 }
 
 impl Default for TxEnv {
@@ -178,10 +175,6 @@ impl TxEnv {
 impl Transaction for TxEnv {
     type AccessListItem<'a> = &'a AccessListItem;
     type Authorization<'a> = &'a Either<SignedAuthorization, RecoveredAuthorization>;
-
-    fn frame_tx_context(&self) -> Option<context_interface::host::FrameTxContext> {
-        self.frame_tx.clone()
-    }
 
     fn tx_type(&self) -> u8 {
         self.tx_type
@@ -479,7 +472,6 @@ impl TxEnvBuilder {
         }
 
         let mut tx = TxEnv {
-            frame_tx: None,
             tx_type: self.tx_type.unwrap_or(0),
             caller: self.caller,
             gas_limit: self.gas_limit,
@@ -572,7 +564,6 @@ impl TxEnvBuilder {
         }
 
         let mut tx = TxEnv {
-            frame_tx: None,
             tx_type: self.tx_type.unwrap_or(0),
             caller: self.caller,
             gas_limit: self.gas_limit,
@@ -659,7 +650,6 @@ impl TxEnv {
     /// Modify the [`TxEnv`] by using builder pattern.
     pub fn modify(self) -> TxEnvBuilder {
         let TxEnv {
-            frame_tx: _,
             tx_type,
             caller,
             gas_limit,
