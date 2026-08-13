@@ -19,6 +19,73 @@ pub enum LoadError {
     DBError,
 }
 
+/// EIP-8141 frame transaction context.
+///
+/// Frame transactions decompose a transaction into frames that validate it,
+/// approve gas payment and execute user operations. The introspection opcodes
+/// (`TXPARAM`, `FRAMEPARAM`, `SIGPARAM`, `FRAMEDATALOAD`, `FRAMEDATACOPY`) read
+/// from this context; outside a frame transaction it is absent and those opcodes
+/// halt exceptionally.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FrameTxContext {
+    /// The declared sender of the transaction.
+    pub sender: Address,
+    /// Sender nonce.
+    pub nonce: u64,
+    /// Canonical signature hash, `TXPARAM(0x08)`.
+    pub sig_hash: B256,
+    /// Maximum cost the payer may be charged, `TXPARAM(0x06)`.
+    pub max_cost: U256,
+    /// `TXPARAM(0x03)`.
+    pub max_priority_fee_per_gas: U256,
+    /// `TXPARAM(0x04)`.
+    pub max_fee_per_gas: U256,
+    /// `TXPARAM(0x05)`.
+    pub max_fee_per_blob_gas: U256,
+    /// Number of blob versioned hashes, `TXPARAM(0x07)`.
+    pub blob_count: u64,
+    /// Index of the frame currently executing, `TXPARAM(0x0A)`.
+    pub frame_index: u64,
+    /// Every frame in the transaction, in order.
+    pub frames: Vec<FrameInfo>,
+    /// Every signature entry in the transaction, in order.
+    pub signatures: Vec<FrameSigInfo>,
+}
+
+/// A single frame within a frame transaction, as seen by `FRAMEPARAM`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FrameInfo {
+    /// Target after resolving a null target to `tx.sender`.
+    pub resolved_target: Address,
+    /// Gas limit allotted to this frame.
+    pub gas_limit: u64,
+    /// Frame mode: 0 DEFAULT, 1 VERIFY, 2 SENDER.
+    pub mode: u8,
+    /// Frame flags.
+    pub flags: u8,
+    /// Value transferred by the frame.
+    pub value: U256,
+    /// Execution status: 0 failed, 1 success, 2 skipped. Only meaningful for a
+    /// frame that has already run.
+    pub status: u8,
+    /// Calldata supplied to the frame.
+    pub data: Bytes,
+}
+
+/// A signature entry, as seen by `SIGPARAM`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FrameSigInfo {
+    /// Signer after resolving an absent signer to `tx.sender`. `None` for
+    /// `ARBITRARY` entries, which have no protocol-assigned signer.
+    pub resolved_signer: Option<Address>,
+    /// Signature scheme: 0 ARBITRARY, 1 SECP256K1, 2 P256.
+    pub scheme: u8,
+    /// Explicit 32-byte digest, or zero when the entry signs the canonical hash.
+    pub msg: B256,
+    /// Raw signature bytes. Only readable for `ARBITRARY` entries.
+    pub signature: Bytes,
+}
+
 /// Host trait with all methods that are needed by the Interpreter.
 ///
 /// This trait is implemented for all types that have `ContextTr` trait.
@@ -68,6 +135,25 @@ pub trait Host {
 
     /// Returns whether state gas (EIP-8037) is enabled.
     fn is_amsterdam_eip8037_enabled(&self) -> bool;
+
+    /* EIP-8141 frame transaction */
+
+    /// Frame transaction context, or `None` when this is not a frame transaction.
+    ///
+    /// Defaults to `None` so that hosts which do not model frame transactions
+    /// compile unchanged; the frame opcodes then halt exceptionally, which is
+    /// what the spec requires outside a frame transaction.
+    fn frame_context(&self) -> Option<&FrameTxContext> {
+        None
+    }
+
+    /// Applies `APPROVE` for the given scope, returning whether it succeeded.
+    ///
+    /// Defaults to rejecting, so a host that has not opted in cannot silently
+    /// approve payment or execution.
+    fn frame_approve(&mut self, _scope: u64) -> bool {
+        false
+    }
 
     /* Database */
 
@@ -210,6 +296,12 @@ pub trait Host {
 #[derive(Default, Debug)]
 pub struct DummyHost {
     gas_params: GasParams,
+    /// Optional EIP-8141 frame transaction context, so tests and non-consensus
+    /// hosts can exercise the frame instructions. `None` means "not a frame
+    /// transaction", which makes those instructions halt.
+    pub frame_tx: Option<FrameTxContext>,
+    /// Scopes that [`Host::frame_approve`] will accept, as a bitmask.
+    pub approvable_scopes: u64,
 }
 
 impl DummyHost {
@@ -217,11 +309,29 @@ impl DummyHost {
     pub fn new(spec: SpecId) -> Self {
         Self {
             gas_params: GasParams::new_spec(spec),
+            ..Default::default()
         }
     }
 }
 
+impl DummyHost {
+    /// Installs a frame transaction context and permits the given approval scopes.
+    pub fn with_frame_tx(mut self, frame_tx: FrameTxContext, approvable_scopes: u64) -> Self {
+        self.frame_tx = Some(frame_tx);
+        self.approvable_scopes = approvable_scopes;
+        self
+    }
+}
+
 impl Host for DummyHost {
+    fn frame_context(&self) -> Option<&FrameTxContext> {
+        self.frame_tx.as_ref()
+    }
+
+    fn frame_approve(&mut self, scope: u64) -> bool {
+        scope != 0 && scope & !self.approvable_scopes == 0
+    }
+
     fn basefee(&self) -> U256 {
         U256::ZERO
     }
