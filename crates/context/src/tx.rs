@@ -179,8 +179,8 @@ impl Transaction for TxEnv {
     type AccessListItem<'a> = &'a AccessListItem;
     type Authorization<'a> = &'a Either<SignedAuthorization, RecoveredAuthorization>;
 
-    fn frame_tx_context(&self) -> Option<&context_interface::host::FrameTxContext> {
-        self.frame_tx.as_ref()
+    fn frame_tx_context(&self) -> Option<context_interface::host::FrameTxContext> {
+        self.frame_tx.clone()
     }
 
     fn tx_type(&self) -> u8 {

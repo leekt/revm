@@ -151,7 +151,7 @@ pub trait Host {
     /// Defaults to `None` so that hosts which do not model frame transactions
     /// compile unchanged; the frame opcodes then halt exceptionally, which is
     /// what the spec requires outside a frame transaction.
-    fn frame_context(&self) -> Option<&FrameTxContext> {
+    fn frame_context(&self) -> Option<FrameTxContext> {
         None
     }
 
@@ -334,8 +334,8 @@ impl DummyHost {
 }
 
 impl Host for DummyHost {
-    fn frame_context(&self) -> Option<&FrameTxContext> {
-        self.frame_tx.as_ref()
+    fn frame_context(&self) -> Option<FrameTxContext> {
+        self.frame_tx.clone()
     }
 
     fn frame_approve(&mut self, scope: u64) -> bool {

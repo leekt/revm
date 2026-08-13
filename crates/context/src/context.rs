@@ -491,7 +491,7 @@ impl<
 
     /* EIP-8141 frame transaction */
 
-    fn frame_context(&self) -> Option<&context_interface::host::FrameTxContext> {
+    fn frame_context(&self) -> Option<context_interface::host::FrameTxContext> {
         self.tx().frame_tx_context()
     }
 
