@@ -29,15 +29,68 @@ const SIGPARAM_COPY_STACK: usize = 5;
 /// Signature scheme id for `ARBITRARY` entries.
 const SCHEME_ARBITRARY: u8 = 0x00;
 
+/// A process-local EIP-8141 frame transaction context.
+///
+/// Frame transactions are a draft, and wiring their context through `TxEnv` or
+/// the `Transaction` trait would change types the whole ecosystem constructs --
+/// downstream crates build `TxEnv` with struct literals, and adding a trait
+/// method forces lifetime bounds on every implementor. Both break crates that
+/// have nothing to do with EIP-8141.
+///
+/// So tooling installs the context here instead. It is scoped to the current
+/// thread, which matches how test runners execute: one transaction at a time per
+/// thread. A host that models frame transactions natively should override
+/// [`Host::frame_context`] instead and ignore this entirely; the instructions
+/// prefer the host and fall back to this slot.
+#[cfg(feature = "std")]
+mod slot {
+    use super::FrameTxContext;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static FRAME_TX: RefCell<Option<FrameTxContext>> = const { RefCell::new(None) };
+    }
+
+    /// Installs a frame transaction context for the current thread.
+    pub fn set(context: Option<FrameTxContext>) {
+        FRAME_TX.with(|slot| *slot.borrow_mut() = context);
+    }
+
+    /// Returns the current thread's frame transaction context, if any.
+    pub fn get() -> Option<FrameTxContext> {
+        FRAME_TX.with(|slot| slot.borrow().clone())
+    }
+}
+
+#[cfg(feature = "std")]
+pub use slot::{get as frame_tx_context, set as set_frame_tx_context};
+
+/// Resolves the active frame transaction context: the host first, then the
+/// thread-local slot that tooling installs.
+fn active_context<H: Host + ?Sized>(host: &H) -> Option<FrameTxContext> {
+    if let Some(ctx) = host.frame_context() {
+        return Some(ctx);
+    }
+    #[cfg(feature = "std")]
+    {
+        return frame_tx_context();
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        None
+    }
+}
+
 /// Implements the APPROVE instruction (0xaa).
 ///
 /// Exits the current frame successfully like RETURN, and updates the
 /// transaction-scoped approval context. The memory region `[offset, offset+len)`
 /// becomes the frame's return data, and only memory expansion is charged.
 pub fn approve<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
-    if context.host.frame_context().is_none() {
+    let Some(frame) = active_context(context.host) else {
         return Err(InstructionResult::InvalidFEOpcode);
-    }
+    };
+    let host_models_frames = context.host.frame_context().is_some();
     popn!([offset, len, scope], context.interpreter);
     let scope = u64::try_from(scope).unwrap_or(u64::MAX);
     let len = as_usize_or_fail!(context.interpreter, len);
@@ -55,9 +108,15 @@ pub fn approve<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
             .to_vec()
             .into();
     }
-    // A host that does not model frame transactions rejects, so APPROVE can
-    // never silently succeed where there is nothing to approve.
-    if !context.host.frame_approve(scope) {
+    // A host that models frame transactions decides for itself. Otherwise the
+    // context came from the tooling slot, and the spec's subset rule applies:
+    // the scope must be non-empty and permitted by the frame's flags.
+    let approved = if host_models_frames {
+        context.host.frame_approve(scope)
+    } else {
+        scope != 0 && scope & !frame.approvable_scopes == 0
+    };
+    if !approved {
         return Err(InstructionResult::Revert);
     }
     context
@@ -76,7 +135,7 @@ pub fn approve<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
 /// Reads a transaction-scoped parameter. An undefined parameter halts.
 pub fn txparam<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
     gas!(context.interpreter, gas::BASE);
-    let Some(frame) = context.host.frame_context() else {
+    let Some(frame) = active_context(context.host) else {
         return Err(InstructionResult::InvalidFEOpcode);
     };
     popn_top!([], param, context.interpreter);
@@ -108,7 +167,7 @@ pub fn txparam<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
 /// end of the data.
 pub fn framedataload<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
     gas!(context.interpreter, gas::VERYLOW);
-    let Some(frame) = context.host.frame_context() else {
+    let Some(frame) = active_context(context.host) else {
         return Err(InstructionResult::InvalidFEOpcode);
     };
     popn_top!([offset], frame_index, context.interpreter);
@@ -131,7 +190,7 @@ pub fn framedataload<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Res
 /// Copies from the chosen frame's calldata into memory, zero-extending beyond
 /// the end of the data. Priced exactly as CALLDATACOPY.
 pub fn framedatacopy<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
-    let Some(frame) = context.host.frame_context() else {
+    let Some(frame) = active_context(context.host) else {
         return Err(InstructionResult::InvalidFEOpcode);
     };
     popn!(
@@ -165,7 +224,7 @@ pub fn framedatacopy<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Res
 /// does not exist yet and halts.
 pub fn frameparam<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
     gas!(context.interpreter, gas::BASE);
-    let Some(frame) = context.host.frame_context() else {
+    let Some(frame) = active_context(context.host) else {
         return Err(InstructionResult::InvalidFEOpcode);
     };
     // frameIndex is on top, param second; the result replaces param.
@@ -210,7 +269,7 @@ pub fn frameparam<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result
 /// requirement is checked here -- without this, the copy form would read below
 /// the stack.
 pub fn sigparam<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
-    let Some(frame) = context.host.frame_context() else {
+    let Some(frame) = active_context(context.host) else {
         return Err(InstructionResult::InvalidFEOpcode);
     };
     // Inspect the param before consuming anything: its value decides how many
@@ -485,5 +544,77 @@ mod tests {
             }),
             Err(InstructionResult::Return)
         );
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod slot_tests {
+    use super::*;
+    use crate::{host::DummyHost, InstructionContext as Ictx, Interpreter};
+    use primitives::hardfork::SpecId;
+
+    /// The tooling slot supplies a context to a host that knows nothing about
+    /// frame transactions, which is how a test runner drives these opcodes
+    /// without any shared revm type being changed.
+    #[test]
+    fn slot_supplies_context_to_an_unaware_host() {
+        let mut host = DummyHost::new(SpecId::default());
+        // No context anywhere: the opcode halts.
+        let mut interpreter = Interpreter::default();
+        let _ = interpreter.stack.push(U256::from(0x01u64));
+        assert_eq!(
+            txparam(Ictx {
+                interpreter: &mut interpreter,
+                host: &mut host
+            }),
+            Err(InstructionResult::InvalidFEOpcode)
+        );
+
+        set_frame_tx_context(Some(FrameTxContext {
+            nonce: 42,
+            approvable_scopes: 0x3,
+            ..Default::default()
+        }));
+
+        let mut interpreter = Interpreter::default();
+        let _ = interpreter.stack.push(U256::from(0x01u64)); // TXPARAM nonce
+        txparam(Ictx {
+            interpreter: &mut interpreter,
+            host: &mut host,
+        })
+        .unwrap();
+        assert_eq!(interpreter.stack.data()[0], U256::from(42u64));
+
+        // APPROVE honours the slot's permitted scopes.
+        let mut interpreter = Interpreter::default();
+        let _ = interpreter.stack.push(U256::from(3u64));
+        let _ = interpreter.stack.push(U256::ZERO);
+        let _ = interpreter.stack.push(U256::ZERO);
+        assert_eq!(
+            approve(Ictx {
+                interpreter: &mut interpreter,
+                host: &mut host
+            }),
+            Err(InstructionResult::Return)
+        );
+
+        // A scope outside the permitted mask reverts.
+        set_frame_tx_context(Some(FrameTxContext {
+            approvable_scopes: 0x1,
+            ..Default::default()
+        }));
+        let mut interpreter = Interpreter::default();
+        let _ = interpreter.stack.push(U256::from(3u64));
+        let _ = interpreter.stack.push(U256::ZERO);
+        let _ = interpreter.stack.push(U256::ZERO);
+        assert_eq!(
+            approve(Ictx {
+                interpreter: &mut interpreter,
+                host: &mut host
+            }),
+            Err(InstructionResult::Revert)
+        );
+
+        set_frame_tx_context(None);
     }
 }

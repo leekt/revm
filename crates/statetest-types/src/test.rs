@@ -90,7 +90,6 @@ impl Test {
         })?;
 
         let tx = TxEnv {
-            frame_tx: None,
             caller,
             gas_price: unit
                 .transaction
