@@ -570,17 +570,21 @@ opcodes! {
     // 0xA7
     // 0xA8
     // 0xA9
-    // 0xAA
+    // EIP-8141 frame transactions. APPROVE exits the frame like RETURN, so it is
+    // terminating. SIGPARAM's arity varies with its `param` operand (2 for the
+    // metadata forms, 5 for the copy form); stack_io cannot express that, so the
+    // metadata form is declared and the copy form is range-checked at runtime.
+    0xAA => APPROVE => stack_io(3, 0), terminating;
     // 0xAB
     // 0xAC
     // 0xAD
     // 0xAE
     // 0xAF
-    // 0xB0
-    // 0xB1
-    // 0xB2
-    // 0xB3
-    // 0xB4
+    0xB0 => TXPARAM => stack_io(1, 1);
+    0xB1 => FRAMEDATALOAD => stack_io(2, 1);
+    0xB2 => FRAMEDATACOPY => stack_io(4, 0);
+    0xB3 => FRAMEPARAM => stack_io(2, 1);
+    0xB4 => SIGPARAM => stack_io(2, 1);
     // 0xB5
     // 0xB6
     // 0xB7

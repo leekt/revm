@@ -12,6 +12,9 @@ pub mod block_info;
 pub mod contract;
 /// Control flow instructions (JUMP, JUMPI, REVERT, etc.).
 pub mod control;
+
+/// EIP-8141 frame transaction instructions.
+pub mod frame_tx;
 /// Host environment interactions (SLOAD, SSTORE, LOG, etc.).
 pub mod host;
 /// Signed 256-bit integer operations.
@@ -172,6 +175,13 @@ const fn instruction_table_impl<WIRE: InterpreterTypes, H: Host>() -> Instructio
     table[SHR as usize] = Instruction::new(bitwise::shr);
     table[SAR as usize] = Instruction::new(bitwise::sar);
     table[CLZ as usize] = Instruction::new(bitwise::clz);
+
+    table[APPROVE as usize] = Instruction::new(frame_tx::approve);
+    table[TXPARAM as usize] = Instruction::new(frame_tx::txparam);
+    table[FRAMEDATALOAD as usize] = Instruction::new(frame_tx::framedataload);
+    table[FRAMEDATACOPY as usize] = Instruction::new(frame_tx::framedatacopy);
+    table[FRAMEPARAM as usize] = Instruction::new(frame_tx::frameparam);
+    table[SIGPARAM as usize] = Instruction::new(frame_tx::sigparam);
 
     table[KECCAK256 as usize] = Instruction::new(system::keccak256);
 
