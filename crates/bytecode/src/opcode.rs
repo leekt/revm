@@ -181,6 +181,9 @@ impl OpCode {
                 | OpCode::KECCAK256
                 | OpCode::CODECOPY
                 | OpCode::CALLDATACOPY
+                | OpCode::FRAMEDATACOPY
+                | OpCode::SIGDATACOPY
+                | OpCode::EVENTDATACOPY
                 | OpCode::RETURNDATACOPY
                 | OpCode::CALL
                 | OpCode::CALLCODE
@@ -191,6 +194,7 @@ impl OpCode {
                 | OpCode::LOG2
                 | OpCode::LOG3
                 | OpCode::LOG4
+                | OpCode::APPROVE
                 | OpCode::RETURN
                 | OpCode::REVERT
                 | OpCode::CREATE
@@ -571,9 +575,7 @@ opcodes! {
     // 0xA8
     // 0xA9
     // EIP-8141 frame transactions. APPROVE exits the frame like RETURN, so it is
-    // terminating. SIGPARAM's arity varies with its `param` operand (2 for the
-    // metadata forms, 5 for the copy form); stack_io cannot express that, so the
-    // metadata form is declared and the copy form is range-checked at runtime.
+    // terminating.
     0xAA => APPROVE => stack_io(3, 0), terminating;
     // 0xAB
     // 0xAC
@@ -585,11 +587,11 @@ opcodes! {
     0xB2 => FRAMEDATACOPY => stack_io(4, 0);
     0xB3 => FRAMEPARAM => stack_io(2, 1);
     0xB4 => SIGPARAM => stack_io(2, 1);
-    // 0xB5
-    // 0xB6
-    // 0xB7
-    // 0xB8
-    // 0xB9
+    0xB5 => SIGDATACOPY => stack_io(4, 0);
+    0xB6 => RECENTROOTREFLOAD => stack_io(2, 1);
+    0xB7 => TXTRACE => stack_io(2, 1);
+    0xB8 => TXDIFF => stack_io(3, 1);
+    0xB9 => EVENTDATACOPY => stack_io(4, 0);
     // 0xBA
     // 0xBB
     // 0xBC
@@ -650,8 +652,10 @@ opcodes! {
     0xF3 => RETURN       => stack_io(2, 0), terminating;
     0xF4 => DELEGATECALL => stack_io(6, 1);
     0xF5 => CREATE2      => stack_io(4, 1);
-    // 0xF6
-    // 0xF7
+    0xF6 => SETDELEGATE  => stack_io(2, 1);
+    // NON-NORMATIVE toolkit-local assignment: EIP-7851 leaves this opcode TBD,
+    // while 0xF6 is already occupied by the experimental EIP-7819 SETDELEGATE.
+    0xF7 => SETSELFDELEGATE => stack_io(1, 1);
     // 0xF8
     // 0xF9
     0xFA => STATICCALL      => stack_io(6, 1);
@@ -733,8 +737,8 @@ mod tests {
         for _ in OPCODE_INFO.into_iter().flatten() {
             opcode_num += 1;
         }
-        // 154 upstream, plus the six EIP-8141 frame transaction opcodes.
-        assert_eq!(opcode_num, 160);
+        // 154 upstream, eleven frame opcodes, EIP-7819, and toolkit-local EIP-7851.
+        assert_eq!(opcode_num, 167);
     }
 
     #[test]
@@ -787,6 +791,10 @@ mod tests {
         assert!(OpCode::new(MLOAD).unwrap().modifies_memory());
         assert!(OpCode::new(MSTORE).unwrap().modifies_memory());
         assert!(OpCode::new(KECCAK256).unwrap().modifies_memory());
+        assert!(OpCode::new(FRAMEDATACOPY).unwrap().modifies_memory());
+        assert!(OpCode::new(SIGDATACOPY).unwrap().modifies_memory());
+        assert!(OpCode::new(EVENTDATACOPY).unwrap().modifies_memory());
+        assert!(OpCode::new(APPROVE).unwrap().modifies_memory());
         assert!(!OpCode::new(ADD).unwrap().modifies_memory());
         assert!(OpCode::new(LOG0).unwrap().modifies_memory());
         assert!(OpCode::new(LOG1).unwrap().modifies_memory());
@@ -797,5 +805,35 @@ mod tests {
         assert!(OpCode::new(REVERT).unwrap().modifies_memory());
         assert!(OpCode::new(CREATE).unwrap().modifies_memory());
         assert!(OpCode::new(CREATE2).unwrap().modifies_memory());
+    }
+
+    #[test]
+    fn sigdatacopy_metadata() {
+        assert_eq!(SIGDATACOPY, 0xB5);
+        let opcode = OpCode::new(SIGDATACOPY).unwrap();
+        assert_eq!(opcode.as_str(), "SIGDATACOPY");
+        assert_eq!(opcode.input_output(), (4, 0));
+    }
+
+    #[test]
+    fn combined_pfi_opcode_metadata() {
+        for (byte, name, inputs, outputs) in [
+            (0xB6, "RECENTROOTREFLOAD", 2, 1),
+            (0xB7, "TXTRACE", 2, 1),
+            (0xB8, "TXDIFF", 3, 1),
+            (0xB9, "EVENTDATACOPY", 4, 0),
+        ] {
+            let opcode = OpCode::new(byte).unwrap();
+            assert_eq!(opcode.as_str(), name);
+            assert_eq!(opcode.input_output(), (inputs, outputs));
+        }
+    }
+
+    #[test]
+    fn setselfdelegate_metadata_uses_toolkit_local_assignment() {
+        assert_eq!(SETSELFDELEGATE, 0xF7);
+        let opcode = OpCode::new(SETSELFDELEGATE).unwrap();
+        assert_eq!(opcode.as_str(), "SETSELFDELEGATE");
+        assert_eq!(opcode.input_output(), (1, 1));
     }
 }

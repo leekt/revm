@@ -12,6 +12,11 @@ use database_interface::{BENCH_CALLER, BENCH_TARGET};
 use primitives::{eip7825, Address, Bytes, TxKind, B256, U256};
 use std::{vec, vec::Vec};
 
+#[cfg(feature = "serde")]
+const fn eip7851_sender_ecdsa_authenticated_default() -> bool {
+    true
+}
+
 /// The Transaction Environment is a struct that contains all fields that can be found in all Ethereum transaction,
 /// including EIP-4844, EIP-7702, EIP-7873, etc.  It implements the [`Transaction`] trait, which is used inside the EVM to execute a transaction.
 ///
@@ -86,6 +91,16 @@ pub struct TxEnv {
     ///
     /// [EIP-7702]: https://eips.ethereum.org/EIPS/eip-7702
     pub authorization_list: Vec<Either<SignedAuthorization, RecoveredAuthorization>>,
+    /// Whether the protocol transaction envelope authenticated the sender with
+    /// ECDSA for EIP-7851 validation.
+    ///
+    /// Custom-authenticated, impersonated, and simulation transactions should
+    /// set this to `false`. It defaults to `true` for consensus safety.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default = "eip7851_sender_ecdsa_authenticated_default")
+    )]
+    pub eip7851_sender_ecdsa_authenticated: bool,
 }
 
 impl Default for TxEnv {
@@ -170,6 +185,12 @@ impl TxEnv {
     pub fn set_recovered_authorization(&mut self, auth: Vec<RecoveredAuthorization>) {
         self.authorization_list = auth.into_iter().map(Either::Right).collect();
     }
+
+    /// Classifies whether EIP-7851 should treat this transaction's sender as
+    /// authenticated by the protocol ECDSA transaction envelope.
+    pub const fn set_eip7851_sender_ecdsa_authenticated(&mut self, authenticated: bool) {
+        self.eip7851_sender_ecdsa_authenticated = authenticated;
+    }
 }
 
 impl Transaction for TxEnv {
@@ -186,6 +207,10 @@ impl Transaction for TxEnv {
 
     fn caller(&self) -> Address {
         self.caller
+    }
+
+    fn is_eip7851_sender_ecdsa_authenticated(&self) -> bool {
+        self.eip7851_sender_ecdsa_authenticated
     }
 
     fn gas_limit(&self) -> u64 {
@@ -246,6 +271,7 @@ impl Transaction for TxEnv {
 pub struct TxEnvBuilder {
     tx_type: Option<u8>,
     caller: Address,
+    eip7851_sender_ecdsa_authenticated: Option<bool>,
     gas_limit: u64,
     gas_price: u128,
     kind: TxKind,
@@ -266,6 +292,7 @@ impl TxEnvBuilder {
         Self {
             tx_type: None,
             caller: Address::default(),
+            eip7851_sender_ecdsa_authenticated: None,
             gas_limit: eip7825::TX_GAS_LIMIT_CAP,
             gas_price: 0,
             kind: TxKind::Call(Address::default()),
@@ -295,6 +322,13 @@ impl TxEnvBuilder {
     /// Set the caller address
     pub const fn caller(mut self, caller: Address) -> Self {
         self.caller = caller;
+        self
+    }
+
+    /// Classify whether the protocol ECDSA transaction envelope authenticated
+    /// the sender for EIP-7851 validation.
+    pub const fn eip7851_sender_ecdsa_authenticated(mut self, authenticated: bool) -> Self {
+        self.eip7851_sender_ecdsa_authenticated = Some(authenticated);
         self
     }
 
@@ -474,6 +508,9 @@ impl TxEnvBuilder {
         let mut tx = TxEnv {
             tx_type: self.tx_type.unwrap_or(0),
             caller: self.caller,
+            eip7851_sender_ecdsa_authenticated: self
+                .eip7851_sender_ecdsa_authenticated
+                .unwrap_or(true),
             gas_limit: self.gas_limit,
             gas_price: self.gas_price,
             kind: self.kind,
@@ -566,6 +603,9 @@ impl TxEnvBuilder {
         let mut tx = TxEnv {
             tx_type: self.tx_type.unwrap_or(0),
             caller: self.caller,
+            eip7851_sender_ecdsa_authenticated: self
+                .eip7851_sender_ecdsa_authenticated
+                .unwrap_or(true),
             gas_limit: self.gas_limit,
             gas_price: self.gas_price,
             kind: self.kind,
@@ -652,6 +692,7 @@ impl TxEnv {
         let TxEnv {
             tx_type,
             caller,
+            eip7851_sender_ecdsa_authenticated,
             gas_limit,
             gas_price,
             kind,
@@ -669,6 +710,7 @@ impl TxEnv {
         TxEnvBuilder::new()
             .tx_type(Some(tx_type))
             .caller(caller)
+            .eip7851_sender_ecdsa_authenticated(eip7851_sender_ecdsa_authenticated)
             .gas_limit(gas_limit)
             .gas_price(gas_price)
             .kind(kind)
@@ -701,6 +743,34 @@ mod tests {
         };
         let base_fee = 100;
         tx.effective_gas_price(base_fee)
+    }
+
+    #[test]
+    fn eip7851_sender_authentication_defaults_safe_and_survives_builders() {
+        assert!(TxEnv::default().is_eip7851_sender_ecdsa_authenticated());
+        assert!(TxEnv::new_bench().is_eip7851_sender_ecdsa_authenticated());
+        assert!(TxEnvBuilder::default()
+            .build_fill()
+            .is_eip7851_sender_ecdsa_authenticated());
+        assert!(TxEnv::builder_for_bench()
+            .build_fill()
+            .is_eip7851_sender_ecdsa_authenticated());
+
+        let unauthenticated = TxEnv::builder()
+            .eip7851_sender_ecdsa_authenticated(false)
+            .build()
+            .unwrap();
+        assert!(!unauthenticated.is_eip7851_sender_ecdsa_authenticated());
+        assert!(!unauthenticated
+            .clone()
+            .modify()
+            .build()
+            .unwrap()
+            .is_eip7851_sender_ecdsa_authenticated());
+
+        let mut set_directly = TxEnv::default();
+        set_directly.set_eip7851_sender_ecdsa_authenticated(false);
+        assert!(!set_directly.is_eip7851_sender_ecdsa_authenticated());
     }
 
     #[test]

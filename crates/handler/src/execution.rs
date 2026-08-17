@@ -7,8 +7,7 @@ use interpreter::{
     CallInput, CallInputs, CallScheme, CallValue, CreateInputs, CreateScheme, FrameInput,
     GasTracker,
 };
-use primitives::TxKind;
-use state::Bytecode;
+use primitives::{hardfork::SpecId, TxKind};
 use std::boxed::Box;
 
 /// Creates the first [`FrameInput`] from the transaction and the
@@ -48,21 +47,57 @@ pub fn create_init_frame<CTX: ContextTr>(
     gas: &mut GasTracker,
 ) -> Result<Option<FrameInput>, <<CTX::Journal as JournalTr>::Database as Database>::Error> {
     let is_eip2780 = ctx.cfg().is_amsterdam_eip2780_enabled();
+    let spec: SpecId = ctx.cfg().spec().into();
+    let is_eip7851_enabled = ctx.cfg().is_eip7851_enabled() && spec.is_enabled_in(SpecId::PRAGUE);
     let params = ctx.cfg().gas_params();
     let new_account_state_gas = params.new_account_state_gas();
     let create_state_gas = params.create_state_gas();
     let warm_access_cost = params.warm_storage_read_cost();
     let cold_account_additional_cost = params.cold_account_additional_cost();
+    let is_frame_call = ctx.journal().is_frame_transaction_call();
     let (tx, journal) = ctx.tx_journal_mut();
     let input = tx.input().clone();
 
     match tx.kind() {
         TxKind::Call(target_address) => {
-            // Load the recipient once (its access was already charged at the
-            // cold rate at the intrinsic phase).
+            // Frame nonce validation deliberately does not load or warm the
+            // synthetic caller. A nonzero transfer needs the caller account in
+            // journal state; zero-value calls keep avoiding that otherwise
+            // observable load.
+            if is_frame_call && !tx.value().is_zero() {
+                journal.load_account(tx.caller())?;
+            }
+            // Ordinary transactions paid for the recipient in their intrinsic
+            // gas. A synthetic frame has no intrinsic gas, so charge its actual
+            // warm/cold access before forwarding the remaining frame budget.
+            if is_frame_call {
+                if !gas.record_regular_cost(warm_access_cost) {
+                    return Ok(None);
+                }
+                let skip_cold_load = gas.remaining() < cold_account_additional_cost;
+                let is_cold =
+                    match journal.load_account_mut_skip_cold_load(target_address, skip_cold_load) {
+                        Ok(account) => account.is_cold,
+                        Err(JournalLoadError::ColdLoadSkipped) => return Ok(None),
+                        Err(JournalLoadError::DBError(e)) => return Err(e),
+                    };
+                if is_cold && !gas.record_regular_cost(cold_account_additional_cost) {
+                    return Ok(None);
+                }
+            }
             let account = &journal.load_account_with_code(target_address)?.info;
             let recipient_is_empty = account.is_empty();
-            let delegated_address = account.code.as_ref().and_then(Bytecode::eip7702_address);
+            let delegated_address = if spec.is_enabled_in(SpecId::PRAGUE) {
+                account.code.as_ref().and_then(|code| {
+                    if is_eip7851_enabled {
+                        code.delegated_address()
+                    } else {
+                        code.eip7702_address()
+                    }
+                })
+            } else {
+                None
+            };
             let mut known_bytecode = (
                 account.code_hash(),
                 account.code.clone().unwrap_or_default(),

@@ -17,8 +17,11 @@ use context_interface::{
     result::{HaltReasonTr, InvalidHeader, InvalidTransaction, ResultGas},
     Cfg, ContextTr, Database, JournalTr, Transaction,
 };
+use interpreter::instructions::frame_tx::frame_tx_call_match;
 use interpreter::{interpreter_action::FrameInit, GasTracker, InitialAndFloorGas, SharedMemory};
 use primitives::{TxKind, U256};
+
+const FRAME_TRANSACTION_MISMATCH: &str = "synthetic transaction does not match the current frame";
 
 /// Trait for errors that can occur during EVM execution.
 ///
@@ -195,13 +198,52 @@ pub trait Handler {
 
     /// Validates the execution environment and transaction parameters.
     ///
-    /// Calculates initial and floor gas requirements, verifies they are covered by the gas limit,
-    /// validates the transaction against state, and deducts the caller.
+    /// Calculates initial and floor gas requirements, verifies they are covered
+    /// by the gas limit, validates the transaction against state, and deducts
+    /// the caller. A valid current frame call has no transaction
+    /// intrinsic/floor gas and validates the caller without transaction fee or
+    /// nonce modification.
     #[inline]
     fn validate(&self, evm: &mut Self::Evm) -> Result<InitialAndFloorGas, Self::Error> {
-        self.validate_env(evm)?;
-        let mut init_and_floor_gas = self.validate_initial_tx_gas(evm)?;
-        self.validate_against_state_and_deduct_caller(evm, &mut init_and_floor_gas)?;
+        let is_frame_transaction = evm.ctx_ref().journal().is_frame_transaction_active();
+        if is_frame_transaction {
+            if evm.ctx_ref().cfg().is_amsterdam_eip8037_enabled()
+                || evm.ctx_ref().cfg().is_amsterdam_eip2780_enabled()
+            {
+                return Err(InvalidTransaction::Str(
+                    "scalar frame gas does not support Amsterdam state-gas rules".into(),
+                )
+                .into());
+            }
+            let classification = {
+                let context = evm.ctx_ref();
+                frame_tx_call_match(context, context.tx())
+            }
+            .ok_or_else(|| InvalidTransaction::from(FRAME_TRANSACTION_MISMATCH))?;
+            if !evm
+                .ctx()
+                .journal_mut()
+                .begin_frame_transaction_call(classification.sender, classification.is_static)
+            {
+                return Err(InvalidTransaction::from(FRAME_TRANSACTION_MISMATCH).into());
+            }
+        }
+        let is_frame_call = evm.ctx_ref().journal().is_frame_transaction_call();
+        if is_frame_call {
+            validation::validate_frame_env::<_, Self::Error>(evm.ctx())?;
+        } else {
+            self.validate_env(evm)?;
+        }
+        let mut init_and_floor_gas = if is_frame_call {
+            InitialAndFloorGas::new(0, 0)
+        } else {
+            self.validate_initial_tx_gas(evm)?
+        };
+        if is_frame_call {
+            pre_execution::validate_frame_against_state::<_, Self::Error>(evm.ctx())?;
+        } else {
+            self.validate_against_state_and_deduct_caller(evm, &mut init_and_floor_gas)?;
+        }
         Ok(init_and_floor_gas)
     }
 
@@ -215,6 +257,10 @@ pub trait Handler {
     fn tx_gas(&self, evm: &mut Self::Evm, init_and_floor_gas: &InitialAndFloorGas) -> GasTracker {
         let ctx = evm.ctx_ref();
         let tx_gas_limit = ctx.tx().gas_limit();
+        if ctx.journal().is_frame_transaction_call() {
+            let regular = tx_gas_limit.min(ctx.cfg().tx_gas_limit_cap());
+            return GasTracker::new(tx_gas_limit, regular, tx_gas_limit - regular);
+        }
         let (remaining, reservoir) = init_and_floor_gas
             .initial_gas_and_reservoir(tx_gas_limit, ctx.cfg().tx_gas_limit_cap());
         GasTracker::new(tx_gas_limit, remaining, reservoir)
@@ -361,10 +407,12 @@ pub trait Handler {
         // Ensure gas floor is met and minimum floor gas is spent.
         // if `cfg.is_eip7623_disabled` is true, floor gas will be set to zero
         self.eip7623_check_gas_floor(evm, exec_result, init_and_floor_gas);
-        // Return unused gas to caller
-        self.reimburse_caller(evm, exec_result)?;
-        // Pay transaction fees to beneficiary
-        self.reward_beneficiary(evm, exec_result)?;
+        let is_frame_call = evm.ctx_ref().journal().is_frame_transaction_call();
+        if !is_frame_call {
+            // Return unused gas to caller and pay transaction fees to the beneficiary.
+            self.reimburse_caller(evm, exec_result)?;
+            self.reward_beneficiary(evm, exec_result)?;
+        }
         // Build ResultGas from the final gas state
         Ok(result_gas)
     }
@@ -651,10 +699,25 @@ pub trait Handler {
     ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
         take_error::<Self::Error, _>(evm.ctx().error())?;
 
-        let exec_result = post_execution::output(evm.ctx(), result, result_gas);
+        let is_frame_call = evm.ctx_ref().journal().is_frame_transaction_call();
+        let exec_result = if is_frame_call {
+            let success = result.instruction_result().is_ok();
+            let logs = evm
+                .ctx_ref()
+                .journal()
+                .frame_transaction_call_logs()
+                .to_vec();
+            let output = post_execution::output_with_logs(evm.ctx(), result, result_gas, logs);
+            evm.ctx()
+                .journal_mut()
+                .settle_frame_transaction_call(success);
+            output
+        } else {
+            let output = post_execution::output(evm.ctx(), result, result_gas);
+            evm.ctx().journal_mut().commit_tx();
+            output
+        };
 
-        // commit transaction
-        evm.ctx().journal_mut().commit_tx();
         evm.ctx().local_mut().clear();
         evm.frame_stack().clear();
 
@@ -673,7 +736,11 @@ pub trait Handler {
     ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
         // clean up local context. Initcode cache needs to be discarded.
         evm.ctx().local_mut().clear();
-        evm.ctx().journal_mut().discard_tx();
+        if evm.ctx_ref().journal().is_frame_transaction_active() {
+            evm.ctx().journal_mut().abort_frame_transaction();
+        } else {
+            evm.ctx().journal_mut().discard_tx();
+        }
         evm.frame_stack().clear();
         Err(error)
     }

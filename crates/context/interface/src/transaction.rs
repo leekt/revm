@@ -50,6 +50,18 @@ pub trait Transaction {
     /// Note : Common field for all transactions.
     fn caller(&self) -> Address;
 
+    /// Returns whether the sender was authenticated by the protocol transaction
+    /// envelope's ECDSA signature for EIP-7851 validation.
+    ///
+    /// Only protocol ECDSA-authenticated senders are rejected when their code is
+    /// an EIP-7851 ECDSA-disabled delegation. Custom-authenticated,
+    /// impersonated, and simulation transactions should return `false`.
+    /// Defaults to `true` so custom transaction implementations remain
+    /// consensus-safe unless they explicitly classify a non-ECDSA sender.
+    fn is_eip7851_sender_ecdsa_authenticated(&self) -> bool {
+        true
+    }
+
     /// The maximum amount of gas the transaction can use.
     ///
     /// Note : Common field for all transactions.

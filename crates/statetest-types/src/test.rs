@@ -91,6 +91,7 @@ impl Test {
 
         let tx = TxEnv {
             caller,
+            eip7851_sender_ecdsa_authenticated: true,
             gas_price: unit
                 .transaction
                 .gas_price

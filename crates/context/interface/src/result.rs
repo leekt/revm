@@ -858,7 +858,7 @@ pub enum InvalidTransaction {
         /// Gas limit for the transaction.
         gas_limit: u64,
     },
-    /// EIP-3607 Reject transactions from senders with deployed code
+    /// EIP-3607/EIP-7851 reject transactions from senders with disallowed code.
     RejectCallerWithCode,
     /// Transaction account does not have enough amount of ether to cover transferred value and gas_limit*gas_price.
     LackOfFundForMaxFee {
@@ -1118,6 +1118,8 @@ pub enum HaltReason {
     OutOfOffset,
     /// Address collision during contract creation.
     CreateCollision,
+    /// Address collision while applying EIP-7819 `SETDELEGATE`.
+    AddressCollision,
     /// Precompile error.
     PrecompileError,
     /// Precompile error with message from context.
@@ -1158,6 +1160,7 @@ impl fmt::Display for HaltReason {
             Self::StackOverflow => write!(f, "stack overflow"),
             Self::OutOfOffset => write!(f, "out of offset"),
             Self::CreateCollision => write!(f, "create collision"),
+            Self::AddressCollision => write!(f, "address collision"),
             Self::PrecompileError => write!(f, "precompile error"),
             Self::PrecompileErrorWithContext(msg) => write!(f, "precompile error: {msg}"),
             Self::NonceOverflow => write!(f, "nonce overflow"),
