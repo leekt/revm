@@ -12,6 +12,9 @@ enum BytecodeSerde {
     Eip7702 {
         delegated_address: Address,
     },
+    Eip7851 {
+        delegated_address: Address,
+    },
 }
 
 impl Serialize for Bytecode {
@@ -24,6 +27,9 @@ impl Serialize for Bytecode {
             },
             BytecodeKind::Eip7702 => BytecodeSerde::Eip7702 {
                 delegated_address: self.eip7702_address().unwrap(),
+            },
+            BytecodeKind::Eip7851 => BytecodeSerde::Eip7851 {
+                delegated_address: self.eip7851_address().unwrap(),
             },
         };
         repr.serialize(serializer)
@@ -49,6 +55,9 @@ impl<'de> Deserialize<'de> for Bytecode {
             }
             BytecodeSerde::Eip7702 { delegated_address } => {
                 Ok(Self::new_eip7702(delegated_address))
+            }
+            BytecodeSerde::Eip7851 { delegated_address } => {
+                Ok(Self::new_eip7851(delegated_address))
             }
         }
     }

@@ -12,6 +12,24 @@ use primitives::{eip4844, hardfork::SpecId, B256};
 pub fn validate_env<CTX: ContextTr, ERROR: From<InvalidHeader> + From<InvalidTransaction>>(
     context: CTX,
 ) -> Result<(), ERROR> {
+    validate_env_inner(context, false)
+}
+
+/// Validates a frame call's environment without rejecting a maximum nonce,
+/// because frame execution leaves the caller nonce unchanged.
+pub(crate) fn validate_frame_env<
+    CTX: ContextTr,
+    ERROR: From<InvalidHeader> + From<InvalidTransaction>,
+>(
+    context: CTX,
+) -> Result<(), ERROR> {
+    validate_env_inner(context, true)
+}
+
+fn validate_env_inner<CTX: ContextTr, ERROR: From<InvalidHeader> + From<InvalidTransaction>>(
+    context: CTX,
+    allow_max_nonce: bool,
+) -> Result<(), ERROR> {
     let spec = context.cfg().spec().into();
     // `prevrandao` is required for the merge
     if spec.is_enabled_in(SpecId::MERGE) && context.block().prevrandao().is_none() {
@@ -21,7 +39,7 @@ pub fn validate_env<CTX: ContextTr, ERROR: From<InvalidHeader> + From<InvalidTra
     if spec.is_enabled_in(SpecId::CANCUN) && context.block().blob_excess_gas_and_price().is_none() {
         return Err(InvalidHeader::ExcessBlobGasNotSet.into());
     }
-    validate_tx_env::<CTX>(context, spec).map_err(Into::into)
+    validate_tx_env_inner::<CTX>(context, spec, allow_max_nonce).map_err(Into::into)
 }
 
 /// Validate legacy transaction gas price against basefee.
@@ -121,6 +139,14 @@ pub fn validate_eip4844_tx(
 pub fn validate_tx_env<CTX: ContextTr>(
     context: CTX,
     spec_id: SpecId,
+) -> Result<(), InvalidTransaction> {
+    validate_tx_env_inner(context, spec_id, false)
+}
+
+fn validate_tx_env_inner<CTX: ContextTr>(
+    context: CTX,
+    spec_id: SpecId,
+    allow_max_nonce: bool,
 ) -> Result<(), InvalidTransaction> {
     // Check if the transaction's chain id is correct
     let tx = context.tx();
@@ -229,7 +255,7 @@ pub fn validate_tx_env<CTX: ContextTr>(
 
     // Check that the transaction's nonce is not at the maximum value.
     // Incrementing the nonce would overflow. Can't happen in the real world.
-    if tx.nonce() == u64::MAX {
+    if !allow_max_nonce && tx.nonce() == u64::MAX {
         return Err(InvalidTransaction::NonceOverflowInTransaction);
     }
 
@@ -314,7 +340,7 @@ pub fn validate_initial_tx_gas_with_gas_params(
     Ok(gas)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use crate::{api::ExecuteEvm, ExecuteCommitEvm, MainBuilder, MainContext};
     use bytecode::opcode;

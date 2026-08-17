@@ -16,6 +16,9 @@ pub const EIP7702_MAGIC_BYTES: &[u8] = &hex!("ef01");
 /// EIP-7702 first version of bytecode.
 pub const EIP7702_VERSION: u8 = 0;
 
+/// EIP-7851 ECDSA-disabled delegation version.
+pub const EIP7851_VERSION: u8 = 1;
+
 /// EIP-7702 bytecode length: 2 (magic) + 1 (version) + 20 (address) = 23 bytes.
 pub const EIP7702_BYTECODE_LEN: usize = 23;
 
@@ -33,7 +36,7 @@ pub enum Eip7702DecodeError {
     InvalidMagic,
     /// Unsupported version.
     ///
-    /// Only supported version is version 0x00.
+    /// The constructor determines which version is supported.
     UnsupportedVersion,
 }
 

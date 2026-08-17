@@ -106,6 +106,27 @@ pub trait Cfg {
     /// execution charges are applied for empty recipients with value and
     /// EIP-7702-delegated recipients.
     fn is_amsterdam_eip2780_enabled(&self) -> bool;
+
+    /// Returns whether the experimental EIP-7819 `SETDELEGATE` instruction is enabled.
+    ///
+    /// EIP-7819 is not assigned to a hard fork yet, so hosts must opt in explicitly.
+    fn is_eip7819_enabled(&self) -> bool {
+        false
+    }
+
+    /// Returns whether experimental EIP-7851 support is explicitly enabled.
+    ///
+    /// Callers must also require Prague or later before activating the EIP.
+    fn is_eip7851_enabled(&self) -> bool {
+        false
+    }
+
+    /// Returns whether experimental EIP-8151 restricted `ecRecover` is explicitly enabled.
+    ///
+    /// Callers must also require Prague or later before activating the EIP.
+    fn is_eip8151_enabled(&self) -> bool {
+        false
+    }
 }
 
 /// What bytecode analysis to perform

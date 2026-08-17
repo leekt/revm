@@ -154,6 +154,7 @@ pub fn load_account_delegated<H: Host + ?Sized>(
     let mut state_gas_cost = 0;
     let is_berlin = spec.is_enabled_in(SpecId::BERLIN);
     let is_spurious_dragon = spec.is_enabled_in(SpecId::SPURIOUS_DRAGON);
+    let is_eip7851_enabled = spec.is_enabled_in(SpecId::PRAGUE) && host.is_eip7851_enabled();
 
     let additional_cold_cost = host.gas_params().cold_account_additional_cost();
     let warm_storage_read_cost = host.gas_params().warm_storage_read_cost();
@@ -176,9 +177,19 @@ pub fn load_account_delegated<H: Host + ?Sized>(
         return Ok((cost, state_gas_cost, bytecode, code_hash));
     }
 
-    // load delegate code if account is EIP-7702
-    if let Some(address) = account.code.as_ref().and_then(Bytecode::eip7702_address) {
-        // EIP-7702 is enabled after berlin hardfork.
+    let delegated_address = if spec.is_enabled_in(SpecId::PRAGUE) {
+        account.code.as_ref().and_then(|code| {
+            if is_eip7851_enabled {
+                code.delegated_address()
+            } else {
+                code.eip7702_address()
+            }
+        })
+    } else {
+        None
+    };
+    if let Some(address) = delegated_address {
+        // Delegation-target access follows the EIP-2929 warm/cold schedule.
         cost += warm_storage_read_cost;
         if cost > remaining_gas {
             return Err(LoadError::ColdLoadSkipped);

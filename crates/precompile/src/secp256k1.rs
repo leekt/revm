@@ -31,6 +31,15 @@ pub const ECRECOVER: Precompile = Precompile::new(
     ecrecover_precompile,
 );
 
+/// Returns whether raw account code may retain `ecrecover` authority under EIP-8151.
+///
+/// The only permitted non-empty form is an exact EIP-7702 delegation indicator,
+/// `0xef0100 || address`. The delegate address itself is intentionally unrestricted.
+#[inline]
+pub fn is_ecrecover_code_eligible(code: &[u8]) -> bool {
+    code.is_empty() || (code.len() == 23 && code.starts_with(&[0xef, 0x01, 0x00]))
+}
+
 /// `ecrecover` precompile function. Read more about input and output format in [this module docs](self).
 pub fn ec_recover_run(input: &[u8], gas_limit: u64) -> EthPrecompileResult {
     const ECRECOVER_BASE: u64 = 3_000;
@@ -68,5 +77,48 @@ cfg_if::cfg_if! {
         pub use bitcoin_secp256k1::ecrecover;
     } else {
         pub use k256::ecrecover;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ec_recover_run, is_ecrecover_code_eligible};
+
+    /// Pinned to ethereum/EIPs@bf7a4067f263bf7ce01c1511de48473e281d885d.
+    #[test]
+    fn ecrecover_code_restriction() {
+        let mut invalid_input = [0; 128];
+        invalid_input[63] = 27;
+        assert!(ec_recover_run(&invalid_input, 3_000)
+            .unwrap()
+            .bytes
+            .is_empty());
+
+        let mut eip7702_zero_delegate = vec![0xef, 0x01, 0x00];
+        eip7702_zero_delegate.extend_from_slice(&[0; 20]);
+        let mut eip7702_nonzero_delegate = vec![0xef, 0x01, 0x00];
+        eip7702_nonzero_delegate.extend_from_slice(&[0x42; 20]);
+
+        assert!(is_ecrecover_code_eligible(&[]));
+        assert!(is_ecrecover_code_eligible(&eip7702_zero_delegate));
+        assert!(is_ecrecover_code_eligible(&eip7702_nonzero_delegate));
+
+        let mut eip7851 = eip7702_nonzero_delegate.clone();
+        eip7851[2] = 0x01;
+        let mut trailing = eip7702_nonzero_delegate.clone();
+        trailing.push(0);
+        let mut wrong_version = vec![0; 23];
+        wrong_version[..3].copy_from_slice(&[0xef, 0x01, 0x02]);
+
+        for code in [
+            vec![0x00],
+            vec![0xef, 0x01, 0x00],
+            eip7702_nonzero_delegate[..22].to_vec(),
+            trailing,
+            eip7851,
+            wrong_version,
+        ] {
+            assert!(!is_ecrecover_code_eligible(&code), "accepted {code:02x?}");
+        }
     }
 }

@@ -1,8 +1,15 @@
 use auto_impl::auto_impl;
 use context::{Cfg, LocalContextTr};
-use context_interface::{ContextTr, JournalTr};
+use context_interface::{
+    cfg::gas::{COLD_ACCOUNT_ACCESS_COST, WARM_STORAGE_READ_COST},
+    host::LoadError,
+    ContextTr, JournalTr,
+};
 use interpreter::{CallInputs, Gas, InstructionResult, InterpreterResult};
-use precompile::{PrecompileOutput, PrecompileSpecId, PrecompileStatus, Precompiles};
+use precompile::{
+    secp256k1::is_ecrecover_code_eligible, PrecompileHalt, PrecompileId, PrecompileOutput,
+    PrecompileSpecId, PrecompileStatus, Precompiles,
+};
 use primitives::{hardfork::SpecId, Address, AddressSet, Bytes};
 use std::string::{String, ToString};
 
@@ -147,13 +154,71 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for EthPrecompiles {
             return Ok(None);
         };
 
-        let output = precompile
+        let mut output = precompile
             .execute(
                 &inputs.input.as_bytes(context),
                 inputs.gas_limit,
                 inputs.reservoir,
             )
             .map_err(|e| e.to_string())?;
+
+        let is_eip8151_enabled = context.cfg().is_eip8151_enabled()
+            && context.cfg().spec().into().is_enabled_in(SpecId::PRAGUE);
+        if is_eip8151_enabled
+            && matches!(precompile.id(), PrecompileId::EcRec)
+            && output.is_success()
+        {
+            if output.bytes.is_empty() {
+                output.bytes = Bytes::from_static(&[0; 32]);
+            } else if output.bytes.len() == 32 {
+                let recovered_address = Address::from_slice(&output.bytes[12..]);
+                let warm_gas_used = output.gas_used + WARM_STORAGE_READ_COST;
+                let cold_gas_used = output.gas_used + COLD_ACCOUNT_ACCESS_COST;
+
+                if inputs.gas_limit < warm_gas_used {
+                    output = PrecompileOutput::halt(PrecompileHalt::OutOfGas, inputs.reservoir);
+                } else {
+                    let account = match context.load_account_info_skip_cold_load(
+                        recovered_address,
+                        true,
+                        inputs.gas_limit < cold_gas_used,
+                    ) {
+                        Ok(account) => account,
+                        Err(LoadError::ColdLoadSkipped) => {
+                            output =
+                                PrecompileOutput::halt(PrecompileHalt::OutOfGas, inputs.reservoir);
+                            return Ok(Some(precompile_output_to_interpreter_result(
+                                output,
+                                inputs.gas_limit,
+                            )));
+                        }
+                        Err(LoadError::DBError) => {
+                            return Ok(Some(InterpreterResult::new(
+                                InstructionResult::FatalExternalError,
+                                Bytes::new(),
+                                Gas::new_with_regular_gas_and_reservoir(
+                                    inputs.gas_limit,
+                                    inputs.reservoir,
+                                ),
+                            )));
+                        }
+                    };
+
+                    output.gas_used = if account.is_cold {
+                        cold_gas_used
+                    } else {
+                        warm_gas_used
+                    };
+                    let raw_code = account
+                        .code
+                        .as_ref()
+                        .map_or(&[][..], |code| code.original_byte_slice());
+                    if !is_ecrecover_code_eligible(raw_code) {
+                        output.bytes = Bytes::from_static(&[0; 32]);
+                    }
+                }
+            }
+        }
 
         // If this is a top-level precompile call (depth == 1), persist the error message
         // into the local context so it can be returned as output in the final result.
@@ -183,15 +248,504 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for EthPrecompiles {
 mod tests {
     use super::*;
     use crate::{instructions::EthInstructions, ExecuteEvm, MainContext};
-    use context::{Context, Evm, FrameStack, TxEnv};
-    use context_interface::result::{ExecutionResult, HaltReason, OutOfGasError};
+    use bytecode::Bytecode;
+    use context::{BlockEnv, CfgEnv, Context, Evm, FrameStack, TxEnv};
+    use context_interface::{
+        result::{EVMError, ExecutionResult, HaltReason, OutOfGasError},
+        DBErrorMarker, Database,
+    };
     use database::InMemoryDB;
-    use interpreter::interpreter::EthInterpreter;
-    use primitives::{address, hardfork::SpecId, TxKind, U256};
+    use interpreter::{
+        interpreter::EthInterpreter, CallInput, CallScheme, CallValue, InstructionResult,
+    };
+    use primitives::{
+        address, bytes, hardfork::SpecId, AddressMap, HashSet, StorageKey, TxKind, B256, U256,
+    };
     use state::AccountInfo;
+    use std::string::String;
 
     /// Test-only address that hosts an over-spending precompile.
     const OVERSPEND_PRECOMPILE: Address = address!("0000000000000000000000000000000000000100");
+    const ECRECOVER_ADDRESS: Address = address!("0000000000000000000000000000000000000001");
+    const RECOVERED_ADDRESS: Address = address!("7e5f4552091a69125d5dfcb7b8c2659029395bdf");
+    const DELEGATE_ADDRESS: Address = address!("2222222222222222222222222222222222222222");
+
+    type Eip8151Context = Context<BlockEnv, TxEnv, CfgEnv, InMemoryDB>;
+
+    /// Deterministic private key 1 signing the 32-byte hash `0x11..11`.
+    fn valid_ecrecover_input() -> Bytes {
+        bytes!(
+            "1111111111111111111111111111111111111111111111111111111111111111\
+                000000000000000000000000000000000000000000000000000000000000001c\
+                e7c93726a865578504442b1a6827f676e0ed74bdff2be3960d1e253bbcfc4462\
+                6aa772b878bc912bdbb33a0014ec507c4b3896ea85aa914b74dee9b7ac3e56da"
+        )
+    }
+
+    fn recovered_output() -> Bytes {
+        let mut output = [0; 32];
+        output[12..].copy_from_slice(RECOVERED_ADDRESS.as_slice());
+        Bytes::copy_from_slice(&output)
+    }
+
+    fn invalid_ecrecover_input() -> Bytes {
+        let mut input = [0; 128];
+        input[63] = 27;
+        Bytes::copy_from_slice(&input)
+    }
+
+    fn ecrecover_call(input: Bytes, gas_limit: u64) -> CallInputs {
+        CallInputs {
+            input: CallInput::Bytes(input),
+            return_memory_offset: 0..32,
+            gas_limit,
+            reservoir: 0,
+            bytecode_address: ECRECOVER_ADDRESS,
+            known_bytecode: (B256::ZERO, Bytecode::new()),
+            target_address: ECRECOVER_ADDRESS,
+            caller: Address::ZERO,
+            value: CallValue::default(),
+            scheme: CallScheme::Call,
+            is_static: false,
+            charged_new_account_state_gas: false,
+        }
+    }
+
+    fn eip8151_context(spec: SpecId, enabled: bool, db: InMemoryDB) -> Eip8151Context {
+        let mut context: Eip8151Context = Context::new(db, spec);
+        context.cfg.enable_eip8151 = enabled;
+        context
+    }
+
+    fn run_ecrecover<CTX: ContextTr>(
+        context: &mut CTX,
+        precompiles: &mut EthPrecompiles,
+        input: Bytes,
+        gas_limit: u64,
+    ) -> InterpreterResult {
+        <EthPrecompiles as PrecompileProvider<CTX>>::run(
+            precompiles,
+            context,
+            &ecrecover_call(input, gas_limit),
+        )
+        .expect("precompile provider error")
+        .expect("ecrecover must be registered")
+    }
+
+    fn insert_code(db: &mut InMemoryDB, address: Address, code: Bytecode) {
+        db.insert_account_info(
+            address,
+            AccountInfo {
+                code_hash: code.hash_slow(),
+                code: Some(code),
+                ..Default::default()
+            },
+        );
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct TestDbError;
+
+    impl core::fmt::Display for TestDbError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("recovered account read failed")
+        }
+    }
+
+    impl core::error::Error for TestDbError {}
+    impl DBErrorMarker for TestDbError {}
+
+    #[derive(Debug)]
+    struct FailingRecoveredDb {
+        fail_address: Option<Address>,
+        basic_calls: usize,
+    }
+
+    impl FailingRecoveredDb {
+        fn always() -> Self {
+            Self {
+                fail_address: None,
+                basic_calls: 0,
+            }
+        }
+
+        fn recovered_only() -> Self {
+            Self {
+                fail_address: Some(RECOVERED_ADDRESS),
+                basic_calls: 0,
+            }
+        }
+    }
+
+    impl Database for FailingRecoveredDb {
+        type Error = TestDbError;
+
+        fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            self.basic_calls += 1;
+            if self.fail_address.is_none_or(|failed| address == failed) {
+                Err(TestDbError)
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn code_by_hash(&mut self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
+            Ok(Bytecode::new())
+        }
+
+        fn storage(&mut self, _address: Address, _index: StorageKey) -> Result<U256, Self::Error> {
+            Ok(U256::ZERO)
+        }
+
+        fn block_hash(&mut self, _number: u64) -> Result<B256, Self::Error> {
+            Ok(B256::ZERO)
+        }
+    }
+
+    /// Stateful expectations are pinned to
+    /// ethereum/EIPs@bf7a4067f263bf7ce01c1511de48473e281d885d.
+    #[test]
+    fn eip8151_invalid_recovery_keeps_legacy_gas_and_skips_state() {
+        let mut context = eip8151_context(SpecId::PRAGUE, true, InMemoryDB::default());
+        let mut precompiles = EthPrecompiles::new(SpecId::PRAGUE);
+
+        let below_base = run_ecrecover(
+            &mut context,
+            &mut precompiles,
+            invalid_ecrecover_input(),
+            2_999,
+        );
+        assert_eq!(below_base.result, InstructionResult::PrecompileOOG);
+        assert_eq!(below_base.gas.total_gas_spent(), 2_999);
+        assert!(below_base.output.is_empty());
+        assert!(context.journal().evm_state().is_empty());
+
+        let exact_base = run_ecrecover(
+            &mut context,
+            &mut precompiles,
+            invalid_ecrecover_input(),
+            3_000,
+        );
+        assert_eq!(exact_base.result, InstructionResult::Return);
+        assert_eq!(exact_base.gas.total_gas_spent(), 3_000);
+        assert_eq!(exact_base.output, Bytes::from_static(&[0; 32]));
+        assert!(context.journal().evm_state().is_empty());
+    }
+
+    #[test]
+    fn eip8151_warm_and_cold_access_gas_boundaries() {
+        let mut warm_db = InMemoryDB::default();
+        warm_db.insert_account_info(RECOVERED_ADDRESS, AccountInfo::default());
+        let mut warm_context = eip8151_context(SpecId::PRAGUE, true, warm_db);
+        let mut access_list = AddressMap::default();
+        access_list.insert(RECOVERED_ADDRESS, HashSet::default());
+        warm_context.journal_mut().warm_access_list(access_list);
+        let mut precompiles = EthPrecompiles::new(SpecId::PRAGUE);
+
+        let warm_oog = run_ecrecover(
+            &mut warm_context,
+            &mut precompiles,
+            valid_ecrecover_input(),
+            3_099,
+        );
+        assert_eq!(warm_oog.result, InstructionResult::PrecompileOOG);
+        assert_eq!(warm_oog.gas.total_gas_spent(), 3_099);
+
+        let warm = run_ecrecover(
+            &mut warm_context,
+            &mut precompiles,
+            valid_ecrecover_input(),
+            3_100,
+        );
+        assert_eq!(warm.result, InstructionResult::Return);
+        assert_eq!(warm.gas.total_gas_spent(), 3_100);
+        assert_eq!(warm.output, recovered_output());
+
+        let mut cold_context = eip8151_context(SpecId::PRAGUE, true, InMemoryDB::default());
+        let cold_oog = run_ecrecover(
+            &mut cold_context,
+            &mut precompiles,
+            valid_ecrecover_input(),
+            5_599,
+        );
+        assert_eq!(cold_oog.result, InstructionResult::PrecompileOOG);
+        assert_eq!(cold_oog.gas.total_gas_spent(), 5_599);
+        assert!(
+            !cold_context
+                .journal()
+                .evm_state()
+                .contains_key(&RECOVERED_ADDRESS),
+            "an unaffordable cold access must not query or warm the account"
+        );
+
+        let cold = run_ecrecover(
+            &mut cold_context,
+            &mut precompiles,
+            valid_ecrecover_input(),
+            5_600,
+        );
+        assert_eq!(cold.result, InstructionResult::Return);
+        assert_eq!(cold.gas.total_gas_spent(), 5_600);
+        assert_eq!(cold.output, recovered_output());
+    }
+
+    #[test]
+    fn eip8151_flag_and_prague_gate_preserve_legacy_ecrecover() {
+        for (case, spec, enabled) in [
+            ("default off", SpecId::PRAGUE, false),
+            ("pre-Prague", SpecId::CANCUN, true),
+        ] {
+            let mut db = InMemoryDB::default();
+            insert_code(
+                &mut db,
+                RECOVERED_ADDRESS,
+                Bytecode::new_legacy(bytes!("00")),
+            );
+            let mut context = eip8151_context(spec, enabled, db);
+            let mut precompiles = EthPrecompiles::new(spec);
+
+            let invalid = run_ecrecover(
+                &mut context,
+                &mut precompiles,
+                invalid_ecrecover_input(),
+                3_000,
+            );
+            assert_eq!(invalid.result, InstructionResult::Return, "{case}");
+            assert_eq!(invalid.gas.total_gas_spent(), 3_000, "{case}");
+            assert!(invalid.output.is_empty(), "{case}");
+
+            let result = run_ecrecover(
+                &mut context,
+                &mut precompiles,
+                valid_ecrecover_input(),
+                3_000,
+            );
+
+            assert_eq!(result.result, InstructionResult::Return, "{case}");
+            assert_eq!(result.gas.total_gas_spent(), 3_000, "{case}");
+            assert_eq!(result.output, recovered_output(), "{case}");
+            assert!(
+                !context
+                    .journal()
+                    .evm_state()
+                    .contains_key(&RECOVERED_ADDRESS),
+                "{case}: disabled restriction must remain pure"
+            );
+        }
+    }
+
+    #[test]
+    fn eip8151_checks_exact_raw_code_without_changing_call_success() {
+        let mut short = vec![0xef, 0x01, 0x00];
+        short.extend_from_slice(&[0x44; 19]);
+        let mut long = vec![0xef, 0x01, 0x00];
+        long.extend_from_slice(&[0x44; 21]);
+        let mut trailing = Bytecode::new_eip7702(DELEGATE_ADDRESS)
+            .original_bytes()
+            .to_vec();
+        trailing.push(0);
+
+        let cases = [
+            ("absent", None, true),
+            ("empty", Some(Bytecode::new()), true),
+            (
+                "ordinary code",
+                Some(Bytecode::new_legacy(bytes!("00"))),
+                false,
+            ),
+            (
+                "ef0100 zero delegate",
+                Some(Bytecode::new_eip7702(Address::ZERO)),
+                true,
+            ),
+            (
+                "ef0100 nonzero delegate",
+                Some(Bytecode::new_eip7702(DELEGATE_ADDRESS)),
+                true,
+            ),
+            (
+                "exact ef0101",
+                Some(Bytecode::new_eip7851(DELEGATE_ADDRESS)),
+                false,
+            ),
+            (
+                "short ef0100",
+                Some(Bytecode::new_legacy(short.into())),
+                false,
+            ),
+            (
+                "long ef0100",
+                Some(Bytecode::new_legacy(long.into())),
+                false,
+            ),
+            (
+                "trailing ef0100",
+                Some(Bytecode::new_legacy(trailing.into())),
+                false,
+            ),
+        ];
+
+        for (case, code, allowed) in cases {
+            let mut db = InMemoryDB::default();
+            if let Some(code) = code {
+                insert_code(&mut db, RECOVERED_ADDRESS, code);
+            }
+            let mut context = eip8151_context(SpecId::PRAGUE, true, db);
+            let mut precompiles = EthPrecompiles::new(SpecId::PRAGUE);
+
+            let result = run_ecrecover(
+                &mut context,
+                &mut precompiles,
+                valid_ecrecover_input(),
+                5_600,
+            );
+
+            assert_eq!(result.result, InstructionResult::Return, "{case}");
+            assert_eq!(result.gas.total_gas_spent(), 5_600, "{case}");
+            let expected = if allowed {
+                recovered_output()
+            } else {
+                Bytes::from_static(&[0; 32])
+            };
+            assert_eq!(result.output, expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn eip8151_rejected_account_is_warm_on_repeat() {
+        let mut db = InMemoryDB::default();
+        insert_code(
+            &mut db,
+            RECOVERED_ADDRESS,
+            Bytecode::new_legacy(bytes!("00")),
+        );
+        let mut context = eip8151_context(SpecId::PRAGUE, true, db);
+        let mut precompiles = EthPrecompiles::new(SpecId::PRAGUE);
+
+        let cold = run_ecrecover(
+            &mut context,
+            &mut precompiles,
+            valid_ecrecover_input(),
+            5_600,
+        );
+        let warm = run_ecrecover(
+            &mut context,
+            &mut precompiles,
+            valid_ecrecover_input(),
+            3_100,
+        );
+
+        assert_eq!(cold.result, InstructionResult::Return);
+        assert_eq!(cold.gas.total_gas_spent(), 5_600);
+        assert_eq!(cold.output, Bytes::from_static(&[0; 32]));
+        assert_eq!(warm.result, InstructionResult::Return);
+        assert_eq!(warm.gas.total_gas_spent(), 3_100);
+        assert_eq!(warm.output, Bytes::from_static(&[0; 32]));
+    }
+
+    #[test]
+    fn eip8151_does_not_follow_or_warm_delegation_target() {
+        let mut db = InMemoryDB::default();
+        insert_code(
+            &mut db,
+            RECOVERED_ADDRESS,
+            Bytecode::new_eip7702(DELEGATE_ADDRESS),
+        );
+        insert_code(
+            &mut db,
+            DELEGATE_ADDRESS,
+            Bytecode::new_legacy(bytes!("00")),
+        );
+        let mut context = eip8151_context(SpecId::PRAGUE, true, db);
+        let mut precompiles = EthPrecompiles::new(SpecId::PRAGUE);
+
+        let result = run_ecrecover(
+            &mut context,
+            &mut precompiles,
+            valid_ecrecover_input(),
+            5_600,
+        );
+
+        assert_eq!(result.output, recovered_output());
+        assert!(context
+            .journal()
+            .evm_state()
+            .contains_key(&RECOVERED_ADDRESS));
+        assert!(!context
+            .journal()
+            .evm_state()
+            .contains_key(&DELEGATE_ADDRESS));
+    }
+
+    #[test]
+    fn eip8151_reverts_recovered_account_warmth_with_checkpoint() {
+        let mut context = eip8151_context(SpecId::PRAGUE, true, InMemoryDB::default());
+        let mut precompiles = EthPrecompiles::new(SpecId::PRAGUE);
+        let checkpoint = context.journal_mut().checkpoint();
+
+        let first = run_ecrecover(
+            &mut context,
+            &mut precompiles,
+            valid_ecrecover_input(),
+            5_600,
+        );
+        assert_eq!(first.result, InstructionResult::Return);
+        context.journal_mut().checkpoint_revert(checkpoint);
+
+        let after_revert = run_ecrecover(
+            &mut context,
+            &mut precompiles,
+            valid_ecrecover_input(),
+            5_599,
+        );
+        assert_eq!(after_revert.result, InstructionResult::PrecompileOOG);
+        assert_eq!(after_revert.gas.total_gas_spent(), 5_599);
+    }
+
+    #[test]
+    fn eip8151_database_error_occurs_only_after_successful_recovery() {
+        type FailingContext = Context<BlockEnv, TxEnv, CfgEnv, FailingRecoveredDb>;
+
+        let mut invalid_context: FailingContext =
+            Context::new(FailingRecoveredDb::always(), SpecId::PRAGUE);
+        invalid_context.cfg.enable_eip8151 = true;
+        let mut precompiles = EthPrecompiles::new(SpecId::PRAGUE);
+        let invalid = run_ecrecover(
+            &mut invalid_context,
+            &mut precompiles,
+            invalid_ecrecover_input(),
+            3_000,
+        );
+        assert_eq!(invalid.result, InstructionResult::Return);
+        assert_eq!(invalid.output, Bytes::from_static(&[0; 32]));
+        assert_eq!(invalid_context.error, Ok(()));
+        assert_eq!(invalid_context.db().basic_calls, 0);
+
+        let mut context: FailingContext =
+            Context::new(FailingRecoveredDb::recovered_only(), SpecId::PRAGUE);
+        context.cfg.enable_eip8151 = true;
+        let mut evm = Evm {
+            ctx: context,
+            inspector: (),
+            instruction: EthInstructions::<EthInterpreter, _>::new_mainnet_with_spec(
+                SpecId::PRAGUE,
+            ),
+            precompiles: EthPrecompiles::new(SpecId::PRAGUE),
+            frame_stack: FrameStack::new_prealloc(8),
+            #[cfg(feature = "asyncdb")]
+            async_stack: database_interface::async_db::FiberStack::default(),
+        };
+        let tx = TxEnv::builder()
+            .caller(Address::repeat_byte(0xaa))
+            .kind(TxKind::Call(ECRECOVER_ADDRESS))
+            .data(valid_ecrecover_input())
+            .gas_limit(100_000)
+            .build()
+            .unwrap();
+
+        let error = evm.transact_one(tx).unwrap_err();
+        assert_eq!(error, EVMError::Database(TestDbError));
+    }
 
     /// Custom precompile provider that drives the bug path: it returns a
     /// `PrecompileOutput` with `status = Success` and `gas_used = u64::MAX` while

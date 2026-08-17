@@ -6,7 +6,7 @@ use crate::{
 };
 use context_interface::{
     context::{SStoreResult, StateLoad},
-    host::LoadError,
+    host::{LoadError, SetDelegateError},
     journaled_state::AccountInfoLoad,
 };
 use core::cmp::min;
@@ -326,6 +326,69 @@ pub fn tload<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
     Ok(())
 }
 
+/// EIP-7819: Sets delegation code at a deterministic address.
+pub fn setdelegate<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
+    if !context.host.is_eip7819_enabled()
+        || !context
+            .interpreter
+            .runtime_flag
+            .spec_id()
+            .is_enabled_in(SpecId::PRAGUE)
+    {
+        return Err(InstructionResult::NotActivated);
+    }
+    require_non_staticcall!(context.interpreter);
+    popn!([salt, target], context.interpreter);
+
+    let target = target.into_address();
+    let location =
+        primitives::eip7819::setdelegate_address(context.interpreter.input.target_address(), salt);
+    let existed = context
+        .host
+        .set_delegate(location, target)
+        .ok_or(InstructionResult::FatalExternalError)?
+        .map_err(|err| match err {
+            SetDelegateError::AddressCollision => InstructionResult::AddressCollision,
+        })?;
+    if existed {
+        context
+            .interpreter
+            .gas
+            .record_refund(primitives::eip7819::EXISTING_ACCOUNT_REFUND);
+    }
+    push!(context.interpreter, location.into_word().into());
+    Ok(())
+}
+
+/// EIP-7851: Updates the current execution-context account's delegation.
+pub fn setselfdelegate<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
+    if !context.host.is_eip7851_enabled()
+        || !context
+            .interpreter
+            .runtime_flag
+            .spec_id()
+            .is_enabled_in(SpecId::PRAGUE)
+    {
+        return Err(InstructionResult::NotActivated);
+    }
+    require_non_staticcall!(context.interpreter);
+    popn!([target], context.interpreter);
+
+    let target = target.into_address();
+    if target.is_zero() {
+        push!(context.interpreter, U256::ZERO);
+        return Ok(());
+    }
+
+    let authority = context.interpreter.input.target_address();
+    let success = context
+        .host
+        .set_self_delegate(authority, target)
+        .ok_or(InstructionResult::FatalExternalError)?;
+    push!(context.interpreter, U256::from(u8::from(success)));
+    Ok(())
+}
+
 /// Implements the LOG0-LOG4 instructions.
 ///
 /// Appends log record with N topics.
@@ -411,4 +474,253 @@ pub fn selfdestruct<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Resu
     }
 
     Err(InstructionResult::SelfDestruct)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        gas_table, host::DummyHost, instruction_table, interpreter::EthInterpreter, Gas,
+        Interpreter,
+    };
+    use bytecode::{
+        opcode::{SETDELEGATE, SETSELFDELEGATE},
+        Bytecode,
+    };
+    use primitives::{address, eip7819, eip7851, Bytes};
+
+    const EXECUTION_ADDRESS: Address = address!("1111111111111111111111111111111111111111");
+    const TARGET: Address = address!("2222222222222222222222222222222222222222");
+
+    fn setdelegate_interpreter(gas_limit: u64, target: U256, salt: U256) -> Interpreter {
+        let mut interpreter = Interpreter::default()
+            .with_bytecode(Bytecode::new_raw(Bytes::from_static(&[SETDELEGATE])));
+        interpreter.gas = Gas::new(gas_limit);
+        interpreter.runtime_flag.spec_id = SpecId::PRAGUE;
+        interpreter.input.target_address = EXECUTION_ADDRESS;
+        assert!(interpreter.stack.push(target));
+        assert!(interpreter.stack.push(salt));
+        interpreter
+    }
+
+    fn step_setdelegate(
+        interpreter: &mut Interpreter,
+        host: &mut DummyHost,
+    ) -> core::result::Result<(), InstructionResult> {
+        interpreter.step(
+            &instruction_table::<EthInterpreter, DummyHost>(),
+            &gas_table(),
+            host,
+        )
+    }
+
+    fn setselfdelegate_interpreter(gas_limit: u64, target: U256, spec: SpecId) -> Interpreter {
+        let mut interpreter = Interpreter::default()
+            .with_bytecode(Bytecode::new_raw(Bytes::from_static(&[SETSELFDELEGATE])));
+        interpreter.gas = Gas::new(gas_limit);
+        interpreter.runtime_flag.spec_id = spec;
+        interpreter.input.target_address = EXECUTION_ADDRESS;
+        assert!(interpreter.stack.push(target));
+        interpreter
+    }
+
+    #[test]
+    fn setdelegate_uses_reference_address_and_operand_order() {
+        let mut host = DummyHost::default();
+        host.enable_eip7819 = true;
+        let mut interpreter = setdelegate_interpreter(
+            eip7819::EMPTY_ACCOUNT_COST,
+            TARGET.into_word().into(),
+            U256::ZERO,
+        );
+
+        step_setdelegate(&mut interpreter, &mut host).unwrap();
+
+        let location = address!("7a41c03bf3062738d4ad052749101d8ec0f5639d");
+        let location_word: U256 = location.into_word().into();
+        assert_eq!(interpreter.stack.data(), &[location_word]);
+        assert_eq!(host.set_delegate_calls, [(location, TARGET)]);
+        assert_eq!(
+            interpreter.gas.total_gas_spent(),
+            eip7819::EMPTY_ACCOUNT_COST
+        );
+        assert_eq!(interpreter.gas.refunded(), 0);
+    }
+
+    #[test]
+    fn setdelegate_truncates_target_and_refunds_existing_account() {
+        let target = (U256::from(0xabu64) << 160) | U256::from_be_slice(TARGET.as_slice());
+        let mut host = DummyHost::default();
+        host.enable_eip7819 = true;
+        host.set_delegate_result = Some(Ok(true));
+        let mut interpreter = setdelegate_interpreter(30_000, target, U256::from(1u64));
+
+        step_setdelegate(&mut interpreter, &mut host).unwrap();
+
+        assert_eq!(host.set_delegate_calls[0].1, TARGET);
+        assert_eq!(interpreter.gas.refunded(), eip7819::EXISTING_ACCOUNT_REFUND);
+    }
+
+    #[test]
+    fn setdelegate_charges_before_activation_static_and_stack_checks() {
+        let mut disabled = DummyHost::default();
+        let mut interpreter =
+            setdelegate_interpreter(30_000, TARGET.into_word().into(), U256::ZERO);
+        assert_eq!(
+            step_setdelegate(&mut interpreter, &mut disabled),
+            Err(InstructionResult::NotActivated)
+        );
+        assert_eq!(
+            interpreter.gas.total_gas_spent(),
+            eip7819::EMPTY_ACCOUNT_COST
+        );
+        assert!(disabled.set_delegate_calls.is_empty());
+
+        let mut enabled = DummyHost::default();
+        enabled.enable_eip7819 = true;
+        let mut interpreter = setdelegate_interpreter(30_000, U256::ZERO, U256::ZERO);
+        interpreter.stack.clear();
+        interpreter.runtime_flag.is_static = true;
+        assert_eq!(
+            step_setdelegate(&mut interpreter, &mut enabled),
+            Err(InstructionResult::StateChangeDuringStaticCall)
+        );
+        assert_eq!(
+            interpreter.gas.total_gas_spent(),
+            eip7819::EMPTY_ACCOUNT_COST
+        );
+        assert!(enabled.set_delegate_calls.is_empty());
+
+        let mut interpreter = setdelegate_interpreter(
+            eip7819::EMPTY_ACCOUNT_COST - 1,
+            TARGET.into_word().into(),
+            U256::ZERO,
+        );
+        assert_eq!(
+            step_setdelegate(&mut interpreter, &mut enabled),
+            Err(InstructionResult::OutOfGas)
+        );
+        assert_eq!(interpreter.stack.len(), 2, "out of gas popped operands");
+        assert!(enabled.set_delegate_calls.is_empty());
+    }
+
+    #[test]
+    fn setdelegate_collision_halts_after_popping_operands() {
+        let mut host = DummyHost::default();
+        host.enable_eip7819 = true;
+        host.set_delegate_result = Some(Err(SetDelegateError::AddressCollision));
+        let mut interpreter = setdelegate_interpreter(
+            eip7819::EMPTY_ACCOUNT_COST,
+            TARGET.into_word().into(),
+            U256::ZERO,
+        );
+
+        assert_eq!(
+            step_setdelegate(&mut interpreter, &mut host),
+            Err(InstructionResult::AddressCollision)
+        );
+        assert!(interpreter.stack.data().is_empty());
+        assert_eq!(interpreter.gas.refunded(), 0);
+    }
+
+    #[test]
+    fn setselfdelegate_activation_requires_opt_in_and_prague() {
+        let mut disabled = DummyHost::new(SpecId::PRAGUE);
+        let mut interpreter = setselfdelegate_interpreter(
+            eip7851::SETSELFDELEGATE_GAS,
+            TARGET.into_word().into(),
+            SpecId::PRAGUE,
+        );
+        assert_eq!(
+            step_setdelegate(&mut interpreter, &mut disabled),
+            Err(InstructionResult::NotActivated)
+        );
+        assert_eq!(
+            interpreter.gas.total_gas_spent(),
+            eip7851::SETSELFDELEGATE_GAS
+        );
+        assert_eq!(interpreter.stack.len(), 1);
+
+        let mut pre_prague = DummyHost::new(SpecId::CANCUN);
+        pre_prague.enable_eip7851 = true;
+        let mut interpreter = setselfdelegate_interpreter(
+            eip7851::SETSELFDELEGATE_GAS,
+            TARGET.into_word().into(),
+            SpecId::CANCUN,
+        );
+        assert_eq!(
+            step_setdelegate(&mut interpreter, &mut pre_prague),
+            Err(InstructionResult::NotActivated)
+        );
+        assert!(pre_prague.set_self_delegate_calls.is_empty());
+    }
+
+    #[test]
+    fn setselfdelegate_charges_9500_before_oog_and_static_halt() {
+        let mut host = DummyHost::new(SpecId::PRAGUE);
+        host.enable_eip7851 = true;
+        host.set_self_delegate_result = Some(true);
+
+        let mut oog = setselfdelegate_interpreter(
+            eip7851::SETSELFDELEGATE_GAS - 1,
+            TARGET.into_word().into(),
+            SpecId::PRAGUE,
+        );
+        assert_eq!(
+            step_setdelegate(&mut oog, &mut host),
+            Err(InstructionResult::OutOfGas)
+        );
+        assert_eq!(oog.stack.len(), 1);
+        assert!(host.set_self_delegate_calls.is_empty());
+
+        let mut exact = setselfdelegate_interpreter(
+            eip7851::SETSELFDELEGATE_GAS,
+            TARGET.into_word().into(),
+            SpecId::PRAGUE,
+        );
+        step_setdelegate(&mut exact, &mut host).unwrap();
+        assert_eq!(exact.stack.data(), &[U256::from(1)]);
+        assert_eq!(exact.gas.total_gas_spent(), eip7851::SETSELFDELEGATE_GAS);
+        assert_eq!(host.set_self_delegate_calls, [(EXECUTION_ADDRESS, TARGET)]);
+
+        host.set_self_delegate_calls.clear();
+        let mut static_call = setselfdelegate_interpreter(
+            eip7851::SETSELFDELEGATE_GAS,
+            TARGET.into_word().into(),
+            SpecId::PRAGUE,
+        );
+        static_call.runtime_flag.is_static = true;
+        assert_eq!(
+            step_setdelegate(&mut static_call, &mut host),
+            Err(InstructionResult::StateChangeDuringStaticCall)
+        );
+        assert_eq!(static_call.stack.len(), 1);
+        assert_eq!(
+            static_call.gas.total_gas_spent(),
+            eip7851::SETSELFDELEGATE_GAS
+        );
+        assert!(host.set_self_delegate_calls.is_empty());
+    }
+
+    #[test]
+    fn setselfdelegate_uses_context_authority_truncates_low160_and_pushes_status() {
+        let target_word = (U256::from(0xabu64) << 160) | U256::from_be_slice(TARGET.as_slice());
+        let mut host = DummyHost::new(SpecId::PRAGUE);
+        host.enable_eip7851 = true;
+        host.set_self_delegate_result = Some(false);
+        let mut interpreter =
+            setselfdelegate_interpreter(eip7851::SETSELFDELEGATE_GAS, target_word, SpecId::PRAGUE);
+
+        step_setdelegate(&mut interpreter, &mut host).unwrap();
+        assert_eq!(host.set_self_delegate_calls, [(EXECUTION_ADDRESS, TARGET)]);
+        assert_eq!(interpreter.stack.data(), &[U256::ZERO]);
+
+        host.set_self_delegate_calls.clear();
+        host.set_self_delegate_result = Some(true);
+        let mut zero =
+            setselfdelegate_interpreter(eip7851::SETSELFDELEGATE_GAS, U256::ZERO, SpecId::PRAGUE);
+        step_setdelegate(&mut zero, &mut host).unwrap();
+        assert_eq!(zero.stack.data(), &[U256::ZERO]);
+        assert!(host.set_self_delegate_calls.is_empty());
+    }
 }

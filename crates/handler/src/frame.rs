@@ -12,6 +12,7 @@ use context_interface::{
 use core::cmp::min;
 use derive_where::derive_where;
 use interpreter::{
+    instructions::frame_tx::frame_tx_call_requires_static,
     interpreter::{EthInterpreter, ExtBytecode},
     interpreter_action::FrameInit,
     interpreter_types::ReturnData,
@@ -151,10 +152,17 @@ impl EthFrame<EthInterpreter> {
         precompiles: &mut PRECOMPILES,
         depth: usize,
         memory: SharedMemory,
-        inputs: Box<CallInputs>,
+        mut inputs: Box<CallInputs>,
     ) -> Result<ItemOrResult<FrameToken, FrameResult>, ERROR> {
         let reservoir_remaining_gas = inputs.reservoir;
         let charged_new_account_state_gas = inputs.charged_new_account_state_gas;
+        let frame_static = if depth == 0 {
+            ctx.journal().frame_transaction_call_is_static()
+        } else {
+            frame_tx_call_requires_static(ctx, inputs.target_address)
+        };
+        let is_static = inputs.is_static || frame_static;
+        inputs.is_static = is_static;
         let gas =
             Gas::new_with_regular_gas_and_reservoir(inputs.gas_limit, reservoir_remaining_gas);
 
@@ -175,6 +183,10 @@ impl EthFrame<EthInterpreter> {
         // Check depth
         if depth > CALL_STACK_LIMIT as usize {
             return return_result(InstructionResult::CallTooDeep);
+        }
+
+        if is_static && inputs.transfers_value() {
+            return return_result(InstructionResult::CallNotAllowedInsideStatic);
         }
 
         // Create subroutine checkpoint
@@ -201,7 +213,6 @@ impl EthFrame<EthInterpreter> {
             call_value: inputs.value.get(),
             depth,
         };
-        let is_static = inputs.is_static;
         let gas_limit = inputs.gas_limit;
 
         if let Some(result) = precompiles.run(ctx, &inputs).map_err(ERROR::from_string)? {

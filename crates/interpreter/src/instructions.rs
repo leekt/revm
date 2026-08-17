@@ -182,6 +182,11 @@ const fn instruction_table_impl<WIRE: InterpreterTypes, H: Host>() -> Instructio
     table[FRAMEDATACOPY as usize] = Instruction::new(frame_tx::framedatacopy);
     table[FRAMEPARAM as usize] = Instruction::new(frame_tx::frameparam);
     table[SIGPARAM as usize] = Instruction::new(frame_tx::sigparam);
+    table[SIGDATACOPY as usize] = Instruction::new(frame_tx::sigdatacopy);
+    table[RECENTROOTREFLOAD as usize] = Instruction::new(frame_tx::recentrootrefload);
+    table[TXTRACE as usize] = Instruction::new(frame_tx::txtrace);
+    table[TXDIFF as usize] = Instruction::new(frame_tx::txdiff);
+    table[EVENTDATACOPY as usize] = Instruction::new(frame_tx::eventdatacopy);
 
     table[KECCAK256 as usize] = Instruction::new(system::keccak256);
 
@@ -315,6 +320,8 @@ const fn instruction_table_impl<WIRE: InterpreterTypes, H: Host>() -> Instructio
     table[RETURN as usize] = Instruction::new(control::ret);
     table[DELEGATECALL as usize] = Instruction::new(contract::call::<DELEGATECALL, _, _>);
     table[CREATE2 as usize] = Instruction::new(contract::create::<true, _, _>);
+    table[SETDELEGATE as usize] = Instruction::new(host::setdelegate);
+    table[SETSELFDELEGATE as usize] = Instruction::new(host::setselfdelegate);
 
     table[STATICCALL as usize] = Instruction::new(contract::call::<STATICCALL, _, _>);
     table[REVERT as usize] = Instruction::new(control::revert);
@@ -355,6 +362,13 @@ const fn gas_table_impl() -> GasTable {
     table[SHR as usize] = 3;
     table[SAR as usize] = 3;
     table[CLZ as usize] = 5;
+
+    table[FRAMEDATACOPY as usize] = 3;
+    table[SIGDATACOPY as usize] = 3;
+    table[RECENTROOTREFLOAD as usize] = 3;
+    table[TXTRACE as usize] = frame_tx::PROVISIONAL_TXTRACE_GAS;
+    table[TXDIFF as usize] = frame_tx::PROVISIONAL_TXTRACE_GAS;
+    table[EVENTDATACOPY as usize] = 3;
 
     table[KECCAK256 as usize] = gas::KECCAK256 as u16;
 
@@ -490,6 +504,8 @@ const fn gas_table_impl() -> GasTable {
     table[RETURN as usize] = 0;
     table[DELEGATECALL as usize] = 40;
     table[CREATE2 as usize] = 0;
+    table[SETDELEGATE as usize] = primitives::eip7819::EMPTY_ACCOUNT_COST as u16;
+    table[SETSELFDELEGATE as usize] = primitives::eip7851::SETSELFDELEGATE_GAS as u16;
 
     table[STATICCALL as usize] = 40;
     table[REVERT as usize] = 0;
@@ -500,7 +516,7 @@ const fn gas_table_impl() -> GasTable {
 
 #[cfg(test)]
 mod tests {
-    use super::instruction_table;
+    use super::{gas_table, instruction_table};
     use crate::{host::DummyHost, interpreter::EthInterpreter};
     use bytecode::opcode::*;
 
@@ -520,6 +536,22 @@ mod tests {
                 "Opcode 0x{i:X?} is not handled",
             );
         }
+    }
+
+    #[test]
+    fn frame_copy_gas_matches_calldatacopy() {
+        let table = gas_table();
+        assert_eq!(table[FRAMEDATACOPY as usize], table[CALLDATACOPY as usize]);
+        assert_eq!(table[SIGDATACOPY as usize], table[CALLDATACOPY as usize]);
+        assert_eq!(table[EVENTDATACOPY as usize], table[CALLDATACOPY as usize]);
+    }
+
+    #[test]
+    fn combined_pfi_static_gas() {
+        let table = gas_table();
+        assert_eq!(table[RECENTROOTREFLOAD as usize], 3);
+        assert_eq!(table[TXTRACE as usize], 100);
+        assert_eq!(table[TXDIFF as usize], 100);
     }
 
     #[test]

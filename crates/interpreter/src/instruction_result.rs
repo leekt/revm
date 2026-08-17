@@ -76,6 +76,8 @@ pub enum InstructionResult {
     OutOfOffset,
     /// Address collision during contract creation.
     CreateCollision,
+    /// Address collision while applying EIP-7819 `SETDELEGATE`.
+    AddressCollision,
     /// Payment amount overflow.
     OverflowPayment,
     /// Error in precompiled contract execution.
@@ -133,6 +135,7 @@ impl From<HaltReason> for InstructionResult {
             HaltReason::StackUnderflow => Self::StackUnderflow,
             HaltReason::OutOfOffset => Self::OutOfOffset,
             HaltReason::CreateCollision => Self::CreateCollision,
+            HaltReason::AddressCollision => Self::AddressCollision,
             HaltReason::PrecompileError => Self::PrecompileError,
             HaltReason::PrecompileErrorWithContext(_) => Self::PrecompileError,
             HaltReason::NonceOverflow => Self::NonceOverflow,
@@ -204,6 +207,7 @@ macro_rules! return_error {
             | $crate::InstructionResult::StackOverflow
             | $crate::InstructionResult::OutOfOffset
             | $crate::InstructionResult::CreateCollision
+            | $crate::InstructionResult::AddressCollision
             | $crate::InstructionResult::OverflowPayment
             | $crate::InstructionResult::PrecompileError
             | $crate::InstructionResult::NonceOverflow
@@ -362,6 +366,7 @@ impl<HaltReasonTr: From<HaltReason>> From<InstructionResult> for SuccessOrHalt<H
             InstructionResult::StackOverflow => Self::Halt(HaltReason::StackOverflow.into()),
             InstructionResult::OutOfOffset => Self::Halt(HaltReason::OutOfOffset.into()),
             InstructionResult::CreateCollision => Self::Halt(HaltReason::CreateCollision.into()),
+            InstructionResult::AddressCollision => Self::Halt(HaltReason::AddressCollision.into()),
             InstructionResult::OverflowPayment => Self::Halt(HaltReason::OverflowPayment.into()), // Check for first call is done separately.
             InstructionResult::PrecompileError => Self::Halt(HaltReason::PrecompileError.into()),
             InstructionResult::NonceOverflow => Self::Halt(HaltReason::NonceOverflow.into()),
@@ -440,6 +445,7 @@ mod tests {
             InstructionResult::StackOverflow,
             InstructionResult::OutOfOffset,
             InstructionResult::CreateCollision,
+            InstructionResult::AddressCollision,
             InstructionResult::OverflowPayment,
             InstructionResult::PrecompileError,
             InstructionResult::NonceOverflow,

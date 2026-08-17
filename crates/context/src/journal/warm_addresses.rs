@@ -93,6 +93,12 @@ impl WarmAddresses {
         self.access_list = access_list;
     }
 
+    /// Warms one address without adding any storage keys.
+    #[inline]
+    pub fn warm_address(&mut self, address: Address) {
+        self.access_list.entry(address).or_default();
+    }
+
     /// Returns the access list.
     #[inline]
     pub const fn access_list(&self) -> &AddressMap<HashSet<StorageKey>> {

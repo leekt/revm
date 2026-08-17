@@ -136,8 +136,105 @@ pub trait JournalTr {
     /// Returns the addresses of the precompiles.
     fn precompile_addresses(&self) -> &AddressSet;
 
+    /// Begins an outer frame transaction and prewarms its declared sender.
+    ///
+    /// Returns `false` when this journal does not support frame lifecycles or
+    /// another outer frame transaction is already active. Custom journals can
+    /// retain ordinary behavior by using this default.
+    fn begin_frame_transaction(&mut self, _sender: Address) -> bool {
+        false
+    }
+
+    /// Returns whether an outer frame transaction is active.
+    fn is_frame_transaction_active(&self) -> bool {
+        false
+    }
+
+    /// Latches a fully matched synthetic frame call and opens its checkpoint
+    /// before any frame-specific state loads.
+    fn begin_frame_transaction_call(&mut self, _sender: Address, _is_static: bool) -> bool {
+        false
+    }
+
+    /// Returns whether the current call was latched as a matched frame call.
+    fn is_frame_transaction_call(&self) -> bool {
+        false
+    }
+
+    /// Returns whether the latched top-level frame call must execute statically.
+    fn frame_transaction_call_is_static(&self) -> bool {
+        false
+    }
+
+    /// Returns logs emitted by the current frame without removing cumulative
+    /// outer-transaction logs.
+    fn frame_transaction_call_logs(&self) -> &[Log] {
+        &[]
+    }
+
+    /// Settles the current frame checkpoint and prepares its state delta.
+    fn settle_frame_transaction_call(&mut self, _success: bool) {}
+
+    /// Returns the settled frame's state delta without clearing the outer
+    /// journal. Called by `ExecuteEvm::finalize` between frame calls.
+    ///
+    /// Raw handler integrations that do not call `ExecuteEvm::finalize`, such
+    /// as Foundry's `EthEvm::transact_raw`, must call this once after every
+    /// successful raw frame execution. The returned delta is observational;
+    /// only the cumulative state returned by [`Self::finish_frame_transaction`]
+    /// should be committed to the backing database.
+    fn finalize_frame_transaction_call(&mut self) -> Self::State {
+        self.finalize()
+    }
+
+    /// Finishes the outer frame transaction, returning cumulative state and
+    /// canonical logs while resetting the journal. This is the only frame
+    /// lifecycle state that should be committed to the backing database.
+    fn finish_frame_transaction(&mut self) -> (Self::State, Vec<Log>) {
+        let logs = self.take_logs();
+        (self.finalize(), logs)
+    }
+
+    /// Aborts the outer frame transaction. The default safely discards the
+    /// current ordinary transaction for custom journals that opt into active
+    /// lifecycle reporting without overriding cleanup.
+    fn abort_frame_transaction(&mut self) {
+        self.discard_tx();
+    }
+
+    /// Reads account information for frame nonce validation.
+    ///
+    /// Lifecycle-capable journals must override this with a non-warming lookup.
+    /// The default fails closed so an opt-in custom journal cannot silently
+    /// change EIP-2929 gas through validation.
+    fn frame_transaction_account_info(
+        &mut self,
+        _address: Address,
+    ) -> Result<Option<AccountInfo>, <Self::Database as Database>::Error> {
+        Ok(None)
+    }
+
+    /// Opens a transaction-lifecycle checkpoint that should not count as EVM call depth.
+    /// Lifecycle-capable custom journals should override all three checkpoint methods.
+    fn frame_transaction_checkpoint(&mut self) -> JournalCheckpoint {
+        self.checkpoint()
+    }
+
+    /// Commits the latest transaction-lifecycle checkpoint.
+    fn frame_transaction_checkpoint_commit(&mut self) {
+        self.checkpoint_commit();
+    }
+
+    /// Reverts a transaction-lifecycle checkpoint.
+    fn frame_transaction_checkpoint_revert(&mut self, checkpoint: JournalCheckpoint) {
+        self.checkpoint_revert(checkpoint);
+    }
+
     /// Sets the spec id.
     fn set_spec_id(&mut self, spec_id: SpecId);
+
+    /// Configures EIP-7851 delegation resolution for journal-level loads.
+    fn set_eip7851_enabled(&mut self, _enabled: bool) {}
 
     /// Sets EIP-7708 and EIP-8246 configuration flags.
     ///
