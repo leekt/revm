@@ -74,6 +74,7 @@ impl SystemCallTx for TxEnv {
     ) -> Self {
         TxEnv::builder()
             .caller(caller)
+            .eip7851_sender_ecdsa_authenticated(false)
             .data(data)
             .kind(TxKind::Call(system_contract_address))
             .gas_limit(SYSTEM_CALL_GAS_LIMIT)
@@ -373,7 +374,7 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use crate::{MainBuilder, MainContext};
 
@@ -411,6 +412,7 @@ mod tests {
 
         // EIP-8037 adds a state-gas reservoir on top of the 30M base limit.
         assert_eq!(evm.ctx.tx().gas_limit(), SYSTEM_CALL_GAS_LIMIT);
+        assert!(!evm.ctx.tx().is_eip7851_sender_ecdsa_authenticated());
 
         assert_eq!(
             output.result,

@@ -47,3 +47,6 @@ pub use handler::{
 pub use handler::{ExecuteEvmAsync, SystemCallEvmAsync};
 pub use inspector::{InspectCommitEvm, InspectEvm, InspectSystemCallEvm, Inspector};
 pub use precompile::install_crypto;
+
+#[cfg(test)]
+mod eip7851_tests;

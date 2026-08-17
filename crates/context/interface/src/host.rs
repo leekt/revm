@@ -7,7 +7,8 @@ use crate::{
 };
 use auto_impl::auto_impl;
 use primitives::{hardfork::SpecId, Address, Bytes, Log, StorageKey, StorageValue, B256, U256};
-use state::Bytecode;
+use state::AccountInfo;
+use std::{sync::Arc, vec::Vec};
 
 /// Error that can happen when loading account info.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -17,6 +18,304 @@ pub enum LoadError {
     ColdLoadSkipped,
     /// Database error.
     DBError,
+}
+
+/// Exceptional error returned while applying EIP-7819 `SETDELEGATE`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SetDelegateError {
+    /// The destination contains non-empty code without the EIP-7702 prefix.
+    AddressCollision,
+}
+
+/// EIP-8141 frame transaction context.
+///
+/// Frame transactions decompose a transaction into frames that validate it,
+/// approve gas payment and execute user operations. The introspection opcodes
+/// (`TXPARAM`, `FRAMEPARAM`, `SIGPARAM`, `FRAMEDATALOAD`, `FRAMEDATACOPY`,
+/// `SIGDATACOPY`, `RECENTROOTREFLOAD`, `TXTRACE`, `TXDIFF`, and
+/// `EVENTDATACOPY`) read from this context; outside a frame transaction it is
+/// absent and those opcodes halt exceptionally.
+///
+/// This context does not carry a chain ID. Lifecycle callers must validate the
+/// synthetic transaction's chain ID against the outer transaction externally.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FrameTxContext {
+    /// The declared sender of the transaction.
+    pub sender: Address,
+    /// Shared keyed-nonce sequence, `TXPARAM(0x01)`.
+    pub nonce: u64,
+    /// Sender's legacy account nonce in the transaction pre-state,
+    /// `TXPARAM(0x0C)`.
+    pub legacy_nonce: u64,
+    /// Canonically ordered EIP-8250 nonce keys. Their count is
+    /// `TXPARAM(0x0D)` and the first key is `TXPARAM(0x10)`.
+    pub nonce_keys: Vec<U256>,
+    /// Canonical hash of `nonce_keys`, `TXPARAM(0x0E)`.
+    pub nonce_keys_hash: B256,
+    /// Canonical signature hash, `TXPARAM(0x08)`.
+    pub sig_hash: B256,
+    /// Maximum cost the payer may be charged, `TXPARAM(0x06)`.
+    pub max_cost: U256,
+    /// `TXPARAM(0x03)`.
+    pub max_priority_fee_per_gas: U256,
+    /// `TXPARAM(0x04)`.
+    pub max_fee_per_gas: U256,
+    /// `TXPARAM(0x05)`.
+    pub max_fee_per_blob_gas: U256,
+    /// Number of blob versioned hashes, `TXPARAM(0x07)`.
+    pub blob_count: u64,
+    /// Index of the frame currently executing, `TXPARAM(0x0A)`.
+    pub frame_index: u64,
+    /// Every frame in the transaction, in order.
+    pub frames: Vec<FrameInfo>,
+    /// Every signature entry in the transaction, in order.
+    pub signatures: Vec<FrameSigInfo>,
+    /// Verified recent-root references in transaction order. Their count is
+    /// `TXPARAM(0x0F)`.
+    pub recent_root_references: Vec<FrameTxRecentRootReference>,
+    /// Transaction-local state diff and event trace as of the current frame.
+    pub trace: FrameTxTrace,
+    /// Scopes `APPROVE` is permitted to grant, mirroring `frame.flags & 0x3`.
+    pub approvable_scopes: u64,
+    /// Scope `APPROVE` actually granted, or 0. Lets a caller assert what was
+    /// approved rather than only that the frame did not revert.
+    pub approved_scope: u64,
+    /// Frozen event snapshot and derived per-address lookup. This is rebuilt
+    /// when the context is prepared for a host and is never accepted from
+    /// serialized input.
+    #[doc(hidden)]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub event_index: FrameTxEventIndex,
+}
+
+impl FrameTxContext {
+    /// Freezes event data, rebuilds derived lookups, and wraps this context for
+    /// cheap sharing.
+    ///
+    /// Host implementations that supply frame contexts directly should use
+    /// this method before returning the context from [`Host::frame_context`].
+    pub fn into_shared(mut self) -> Arc<Self> {
+        self.event_index.rebuild(&self.trace.events);
+        Arc::new(self)
+    }
+
+    /// Returns the number of events emitted by `address`, or `None` if this
+    /// context has not had its derived event index prepared.
+    pub fn event_count_for_address(&self, address: Address) -> Option<usize> {
+        self.event_index.range(address).map(|range| range.len())
+    }
+
+    /// Maps an address-local event index to its global transaction event index.
+    pub fn event_global_index_for_address(
+        &self,
+        address: Address,
+        local_index: usize,
+    ) -> Option<usize> {
+        let range = self.event_index.range(address)?;
+        let index = range.start.checked_add(local_index)?;
+        (index < range.end).then(|| self.event_index.entries[index].1)
+    }
+
+    /// Returns the immutable event snapshot used by frame instructions, or
+    /// `None` if this context has not been prepared with [`Self::into_shared`].
+    pub fn event_snapshot(&self) -> Option<&[FrameTxEvent]> {
+        self.event_index.events.as_deref()
+    }
+}
+
+/// Frozen transaction events and their index, sorted by emitter and then global
+/// event index. Address lookups perform two binary partitions over `entries`.
+///
+/// Its fields are private so external data cannot construct a trusted index.
+/// Standard installation paths always rebuild it from [`FrameTxTrace::events`].
+#[derive(Clone, Debug, Default)]
+#[doc(hidden)]
+pub struct FrameTxEventIndex {
+    entries: Vec<(Address, usize)>,
+    events: Option<Arc<[FrameTxEvent]>>,
+}
+
+// This cache is not part of the context's semantic value.
+impl PartialEq for FrameTxEventIndex {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for FrameTxEventIndex {}
+
+impl FrameTxEventIndex {
+    fn rebuild(&mut self, events: &[FrameTxEvent]) {
+        let events: Arc<[FrameTxEvent]> = events.to_vec().into();
+        self.entries.clear();
+        self.entries.extend(
+            events
+                .iter()
+                .enumerate()
+                .map(|(index, event)| (event.address, index)),
+        );
+        self.entries
+            .sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        self.events = Some(events);
+    }
+
+    fn range(&self, address: Address) -> Option<core::ops::Range<usize>> {
+        self.events.as_ref()?;
+        let start = self
+            .entries
+            .partition_point(|(candidate, _)| *candidate < address);
+        let end = self
+            .entries
+            .partition_point(|(candidate, _)| *candidate <= address);
+        Some(start..end)
+    }
+}
+
+/// A single frame within a frame transaction, as seen by `FRAMEPARAM`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FrameInfo {
+    /// Target after resolving a null target to `tx.sender`.
+    pub resolved_target: Address,
+    /// Caller expected for the synthetic host call. This is internal binding
+    /// metadata and is not exposed through `FRAMEPARAM`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub expected_caller: Address,
+    /// Gas limit allotted to this frame.
+    pub gas_limit: u64,
+    /// Frame mode: 0 DEFAULT, 1 VERIFY, 2 SENDER, 3 POST_TX.
+    pub mode: u8,
+    /// Frame flags.
+    pub flags: u8,
+    /// Value transferred by the frame.
+    pub value: U256,
+    /// Execution status: 0 failed, 1 success, 2 skipped. Only meaningful for a
+    /// frame that has already run.
+    pub status: u8,
+    /// Calldata supplied to the frame.
+    pub data: Bytes,
+}
+
+/// A signature entry, as seen by `SIGPARAM` and `SIGDATACOPY`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FrameSigInfo {
+    /// Signer after resolving an absent signer to `tx.sender`. `None` for
+    /// `ARBITRARY` entries, which have no protocol-assigned signer.
+    pub resolved_signer: Option<Address>,
+    /// Signature scheme: 0 ARBITRARY, 1 SECP256K1, 2 P256.
+    pub scheme: u8,
+    /// Explicit 32-byte digest, or zero when the entry signs the canonical hash.
+    pub msg: B256,
+    /// Raw signature bytes. Only readable for `ARBITRARY` entries.
+    pub signature: Bytes,
+}
+
+/// A verified EIP-8272 recent-root reference.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FrameTxRecentRootReference {
+    /// Root source identifier.
+    pub source_id: B256,
+    /// Consensus slot containing the root.
+    pub slot: u64,
+    /// Opaque root committed by the source.
+    pub root: B256,
+}
+
+/// One net balance change, ordered by ascending address in [`FrameTxTrace`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FrameTxBalanceDiff {
+    /// Changed account.
+    pub address: Address,
+    /// Balance at transaction start.
+    pub before: U256,
+    /// Balance as of the POST_TX frame.
+    pub after: U256,
+}
+
+/// One net storage change, ordered by `(address, key)` in [`FrameTxTrace`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FrameTxStorageDiff {
+    /// Changed account.
+    pub address: Address,
+    /// Changed storage key.
+    pub key: StorageKey,
+    /// Value at transaction start.
+    pub before: StorageValue,
+    /// Value as of the POST_TX frame.
+    pub after: StorageValue,
+}
+
+/// One newly deployed contract, ordered by ascending address in [`FrameTxTrace`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FrameTxDeployedContract {
+    /// Deployed contract address.
+    pub address: Address,
+    /// Current non-empty, non-delegation code hash.
+    pub code_hash: B256,
+}
+
+/// Account-level nonce and code-hash diff used by direct lookups and flags.
+///
+/// Entries are ordered by ascending address. Balance and storage changes remain
+/// in their dedicated ordered vectors so their TXTRACE global indices are
+/// stable.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FrameTxAccountDiff {
+    /// Changed account.
+    pub address: Address,
+    /// Whether the nonce differs from transaction pre-state. Nonce values are
+    /// deliberately not exposed.
+    pub nonce_changed: bool,
+    /// Code hash at transaction start.
+    pub code_hash_before: B256,
+    /// Code hash as of the POST_TX frame.
+    pub code_hash_after: B256,
+}
+
+/// One event in transaction emission order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FrameTxEvent {
+    /// Contract that emitted the event.
+    pub address: Address,
+    /// Event topics in LOG order, with at most four entries.
+    pub topics: Vec<B256>,
+    /// Non-indexed event data.
+    pub data: Bytes,
+}
+
+/// Precomputed EIP-7906 transaction trace for POST_TX introspection.
+///
+/// Hosts and tooling must provide `balance_diffs`, `account_diffs`, and
+/// `deployed_contracts` in strictly ascending address order, and
+/// `storage_diffs` in ascending `(address, key)` order. `events` remain in
+/// emission order. Diff vectors contain net changes only.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FrameTxTrace {
+    /// Net balance changes.
+    pub balance_diffs: Vec<FrameTxBalanceDiff>,
+    /// Net storage changes.
+    pub storage_diffs: Vec<FrameTxStorageDiff>,
+    /// Contracts deployed by the transaction.
+    pub deployed_contracts: Vec<FrameTxDeployedContract>,
+    /// Account-level nonce and code-hash changes.
+    pub account_diffs: Vec<FrameTxAccountDiff>,
+    /// Events in global transaction log order. [`FrameTxContext::into_shared`]
+    /// freezes this source into the snapshot used by frame instructions.
+    pub events: Vec<FrameTxEvent>,
+    /// Total gas pre-charge deducted from the payer.
+    pub gas_pre_charge: U256,
+    /// Account charged the gas pre-charge.
+    pub gas_payer: Address,
 }
 
 /// Host trait with all methods that are needed by the Interpreter.
@@ -68,6 +367,55 @@ pub trait Host {
 
     /// Returns whether state gas (EIP-8037) is enabled.
     fn is_amsterdam_eip8037_enabled(&self) -> bool;
+
+    /// Returns whether the experimental EIP-7819 `SETDELEGATE` instruction is enabled.
+    fn is_eip7819_enabled(&self) -> bool {
+        false
+    }
+
+    /// Returns whether EIP-7851 is active for the host's current spec.
+    fn is_eip7851_enabled(&self) -> bool {
+        false
+    }
+
+    /* EIP-8141 frame transaction */
+
+    /// Frame transaction context, or `None` when this is not a frame transaction.
+    ///
+    /// Defaults to `None` so that hosts which do not model frame transactions
+    /// compile unchanged; the frame opcodes then halt exceptionally, which is
+    /// what the spec requires outside a frame transaction.
+    fn frame_context(&self) -> Option<Arc<FrameTxContext>> {
+        None
+    }
+
+    /// Applies `APPROVE` for the given scope, returning whether it succeeded.
+    ///
+    /// Defaults to rejecting, so a host that has not opted in cannot silently
+    /// approve payment or execution.
+    fn frame_approve(&mut self, _scope: u64) -> bool {
+        false
+    }
+
+    /// Applies EIP-7819 delegation code at `location`.
+    ///
+    /// Returns whether `location` existed before the write. `None` represents a
+    /// host/database failure; hosts that do not implement EIP-7819 default to `None`.
+    fn set_delegate(
+        &mut self,
+        _location: Address,
+        _target: Address,
+    ) -> Option<Result<bool, SetDelegateError>> {
+        None
+    }
+
+    /// Replaces `authority`'s valid delegation with an ECDSA-disabled one.
+    ///
+    /// Returns `Some(true)` on mutation, `Some(false)` for a zero target or an
+    /// invalid raw authority designation, and `None` on host/database failure.
+    fn set_self_delegate(&mut self, _authority: Address, _target: Address) -> Option<bool> {
+        None
+    }
 
     /* Database */
 
@@ -151,6 +499,7 @@ pub trait Host {
     /// Load account delegated, calls `ContextTr::journal_mut().load_account_delegated(address)`
     #[inline]
     fn load_account_delegated(&mut self, address: Address) -> Option<StateLoad<AccountLoad>> {
+        let is_eip7851_enabled = self.is_eip7851_enabled();
         let account = self
             .load_account_info_skip_cold_load(address, true, false)
             .ok()?;
@@ -163,8 +512,14 @@ pub trait Host {
             account.is_cold,
         );
 
-        // load delegate code if account is EIP-7702
-        if let Some(address) = account.code.as_ref().and_then(Bytecode::eip7702_address) {
+        let delegated_address = account.code.as_ref().and_then(|code| {
+            if is_eip7851_enabled {
+                code.delegated_address()
+            } else {
+                code.eip7702_address()
+            }
+        });
+        if let Some(address) = delegated_address {
             let delegate_account = self
                 .load_account_info_skip_cold_load(address, true, false)
                 .ok()?;
@@ -210,6 +565,37 @@ pub trait Host {
 #[derive(Default, Debug)]
 pub struct DummyHost {
     gas_params: GasParams,
+    spec_id: SpecId,
+    /// Optional EIP-8141 frame transaction context, so tests and non-consensus
+    /// hosts can exercise the frame instructions. `None` means "not a frame
+    /// transaction", which makes those instructions halt.
+    frame_tx: Option<Arc<FrameTxContext>>,
+    /// Scopes that [`Host::frame_approve`] will accept, as a bitmask.
+    pub approvable_scopes: u64,
+    /// Number of calls made to [`Host::frame_approve`].
+    pub frame_approve_calls: usize,
+    /// Enables EIP-7819 for interpreter tests.
+    pub enable_eip7819: bool,
+    /// Enables EIP-7851 for interpreter tests.
+    pub enable_eip7851: bool,
+    /// Result returned by the EIP-7819 state mutation fixture.
+    pub set_delegate_result: Option<Result<bool, SetDelegateError>>,
+    /// Calls made to the EIP-7819 state mutation fixture.
+    pub set_delegate_calls: Vec<(Address, Address)>,
+    /// Result returned by the EIP-7851 state mutation fixture.
+    pub set_self_delegate_result: Option<bool>,
+    /// Calls made to the EIP-7851 state mutation fixture.
+    pub set_self_delegate_calls: Vec<(Address, Address)>,
+    /// Account returned by fixture live-state reads.
+    pub account_info: AccountInfo,
+    /// Whether the next fixture account read is cold.
+    pub account_is_cold: bool,
+    /// Whether the fixture account is empty.
+    pub account_is_empty: bool,
+    /// Value returned by fixture storage reads.
+    pub storage_value: StorageValue,
+    /// Whether the next fixture storage read is cold.
+    pub storage_is_cold: bool,
 }
 
 impl DummyHost {
@@ -217,11 +603,42 @@ impl DummyHost {
     pub fn new(spec: SpecId) -> Self {
         Self {
             gas_params: GasParams::new_spec(spec),
+            spec_id: spec,
+            ..Default::default()
         }
     }
 }
 
+impl DummyHost {
+    /// Installs a frame transaction context and permits the given approval scopes.
+    pub fn with_frame_tx(mut self, frame_tx: FrameTxContext, approvable_scopes: u64) -> Self {
+        self.set_frame_tx_context(Some(frame_tx));
+        self.approvable_scopes = approvable_scopes;
+        self
+    }
+
+    /// Replaces the frame transaction context, rebuilding all derived lookups.
+    pub fn set_frame_tx_context(&mut self, frame_tx: Option<FrameTxContext>) {
+        self.frame_tx = frame_tx.map(FrameTxContext::into_shared);
+    }
+
+    /// Returns the installed frame context mutably when it is not shared.
+    /// Prepared event data remains frozen even if the source trace is changed.
+    pub fn frame_tx_context_mut(&mut self) -> Option<&mut FrameTxContext> {
+        self.frame_tx.as_mut().and_then(Arc::get_mut)
+    }
+}
+
 impl Host for DummyHost {
+    fn frame_context(&self) -> Option<Arc<FrameTxContext>> {
+        self.frame_tx.clone()
+    }
+
+    fn frame_approve(&mut self, scope: u64) -> bool {
+        self.frame_approve_calls += 1;
+        scope != 0 && scope & !self.approvable_scopes == 0
+    }
+
     fn basefee(&self) -> U256 {
         U256::ZERO
     }
@@ -240,6 +657,28 @@ impl Host for DummyHost {
 
     fn is_amsterdam_eip8037_enabled(&self) -> bool {
         false
+    }
+
+    fn is_eip7819_enabled(&self) -> bool {
+        self.enable_eip7819
+    }
+
+    fn is_eip7851_enabled(&self) -> bool {
+        self.enable_eip7851 && self.spec_id.is_enabled_in(SpecId::PRAGUE)
+    }
+
+    fn set_delegate(
+        &mut self,
+        location: Address,
+        target: Address,
+    ) -> Option<Result<bool, SetDelegateError>> {
+        self.set_delegate_calls.push((location, target));
+        Some(self.set_delegate_result.unwrap_or(Ok(false)))
+    }
+
+    fn set_self_delegate(&mut self, authority: Address, target: Address) -> Option<bool> {
+        self.set_self_delegate_calls.push((authority, target));
+        self.set_self_delegate_result
     }
 
     fn difficulty(&self) -> U256 {
@@ -311,9 +750,17 @@ impl Host for DummyHost {
         &mut self,
         _address: Address,
         _load_code: bool,
-        _skip_cold_load: bool,
+        skip_cold_load: bool,
     ) -> Result<AccountInfoLoad<'_>, LoadError> {
-        Ok(Default::default())
+        if self.account_is_cold && skip_cold_load {
+            return Err(LoadError::ColdLoadSkipped);
+        }
+        let is_cold = core::mem::replace(&mut self.account_is_cold, false);
+        Ok(AccountInfoLoad::new(
+            &self.account_info,
+            is_cold,
+            self.account_is_empty,
+        ))
     }
 
     fn sstore_skip_cold_load(
@@ -330,9 +777,13 @@ impl Host for DummyHost {
         &mut self,
         _address: Address,
         _key: StorageKey,
-        _skip_cold_load: bool,
+        skip_cold_load: bool,
     ) -> Result<StateLoad<StorageValue>, LoadError> {
-        Ok(Default::default())
+        if self.storage_is_cold && skip_cold_load {
+            return Err(LoadError::ColdLoadSkipped);
+        }
+        let is_cold = core::mem::replace(&mut self.storage_is_cold, false);
+        Ok(StateLoad::new(self.storage_value, is_cold))
     }
 }
 
@@ -503,6 +954,40 @@ mod tests {
         assert!(
             !load.data.is_empty,
             "is_empty must stay false for the non-empty EIP-7702 account"
+        );
+    }
+
+    #[test]
+    fn dummy_host_live_state_fixture_tracks_warmth() {
+        let mut host = DummyHost::new(SpecId::BERLIN);
+        host.account_info.balance = U256::from(7u64);
+        host.account_is_cold = true;
+        host.storage_value = U256::from(9u64);
+        host.storage_is_cold = true;
+
+        let first_account = host
+            .load_account_info_skip_cold_load(Address::ZERO, false, false)
+            .unwrap();
+        assert!(first_account.is_cold);
+        assert_eq!(first_account.balance, U256::from(7u64));
+        drop(first_account);
+        assert!(
+            !host
+                .load_account_info_skip_cold_load(Address::ZERO, false, false)
+                .unwrap()
+                .is_cold
+        );
+
+        let first_storage = host
+            .sload_skip_cold_load(Address::ZERO, U256::ZERO, false)
+            .unwrap();
+        assert!(first_storage.is_cold);
+        assert_eq!(first_storage.data, U256::from(9u64));
+        assert!(
+            !host
+                .sload_skip_cold_load(Address::ZERO, U256::ZERO, false)
+                .unwrap()
+                .is_cold
         );
     }
 }

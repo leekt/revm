@@ -121,7 +121,7 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
         key: StorageKey,
     ) -> Result<StateLoad<StorageValue>, <Self::Database as Database>::Error> {
         self.inner
-            .sload_assume_account_present(&mut self.database, address, key, false)
+            .sload(&mut self.database, address, key, false)
             .map_err(JournalLoadError::unwrap_db_error)
     }
 
@@ -189,6 +189,82 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     #[inline]
     fn precompile_addresses(&self) -> &AddressSet {
         self.inner.warm_addresses.precompiles()
+    }
+
+    #[inline]
+    fn begin_frame_transaction(&mut self, sender: Address) -> bool {
+        self.inner.begin_frame_transaction(sender)
+    }
+
+    #[inline]
+    fn is_frame_transaction_active(&self) -> bool {
+        self.inner.is_frame_transaction_active()
+    }
+
+    #[inline]
+    fn begin_frame_transaction_call(&mut self, sender: Address, is_static: bool) -> bool {
+        self.inner.begin_frame_transaction_call(sender, is_static)
+    }
+
+    #[inline]
+    fn is_frame_transaction_call(&self) -> bool {
+        self.inner.is_frame_transaction_call()
+    }
+
+    #[inline]
+    fn frame_transaction_call_is_static(&self) -> bool {
+        self.inner.frame_transaction_call_is_static()
+    }
+
+    #[inline]
+    fn frame_transaction_call_logs(&self) -> &[Log] {
+        self.inner.frame_transaction_call_logs()
+    }
+
+    #[inline]
+    fn settle_frame_transaction_call(&mut self, success: bool) {
+        self.inner.settle_frame_transaction_call(success)
+    }
+
+    #[inline]
+    fn finalize_frame_transaction_call(&mut self) -> Self::State {
+        self.inner.finalize_frame_transaction_call()
+    }
+
+    #[inline]
+    fn finish_frame_transaction(&mut self) -> (Self::State, Vec<Log>) {
+        self.inner.finish_frame_transaction()
+    }
+
+    #[inline]
+    fn abort_frame_transaction(&mut self) {
+        self.inner.abort_frame_transaction()
+    }
+
+    #[inline]
+    fn frame_transaction_account_info(
+        &mut self,
+        address: Address,
+    ) -> Result<Option<state::AccountInfo>, <Self::Database as Database>::Error> {
+        if let Some(account) = self.inner.state.get(&address) {
+            return Ok(Some(account.info.clone()));
+        }
+        Ok(Some(self.database.basic(address)?.unwrap_or_default()))
+    }
+
+    #[inline]
+    fn frame_transaction_checkpoint(&mut self) -> JournalCheckpoint {
+        self.inner.frame_transaction_checkpoint()
+    }
+
+    #[inline]
+    fn frame_transaction_checkpoint_commit(&mut self) {
+        self.inner.frame_transaction_checkpoint_commit();
+    }
+
+    #[inline]
+    fn frame_transaction_checkpoint_revert(&mut self, checkpoint: JournalCheckpoint) {
+        self.inner.frame_transaction_checkpoint_revert(checkpoint);
     }
 
     /// Returns call depth.
@@ -307,6 +383,11 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     }
 
     #[inline]
+    fn set_eip7851_enabled(&mut self, enabled: bool) {
+        self.inner.set_eip7851_enabled(enabled);
+    }
+
+    #[inline]
     fn checkpoint(&mut self) -> JournalCheckpoint {
         self.inner.checkpoint()
     }
@@ -364,7 +445,7 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     ) -> Result<StateLoad<StorageValue>, JournalLoadError<<Self::Database as Database>::Error>>
     {
         self.inner
-            .sload_assume_account_present(&mut self.database, address, key, skip_cold_load)
+            .sload(&mut self.database, address, key, skip_cold_load)
     }
 
     #[inline]

@@ -2,13 +2,13 @@
 //!
 //! Those are:
 //! - Legacy bytecode with jump table analysis
-//! - EIP-7702 bytecode, introduced in Prague and contains address to delegated account
+//! - EIP-7702 and EIP-7851 bytecode containing an address to a delegated account
 
 #[cfg(feature = "serde")]
 mod serde_impl;
 
 use crate::{
-    eip7702::{Eip7702DecodeError, EIP7702_MAGIC_BYTES, EIP7702_VERSION},
+    eip7702::{Eip7702DecodeError, EIP7702_MAGIC_BYTES, EIP7702_VERSION, EIP7851_VERSION},
     legacy::analyze_legacy,
     opcode, BytecodeDecodeError, JumpTable,
 };
@@ -28,18 +28,18 @@ pub struct Bytecode(Arc<BytecodeInner>);
 #[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 struct BytecodeInner {
-    /// The kind of bytecode (Legacy or EIP-7702).
+    /// The kind of bytecode (legacy or a delegation designation).
     kind: BytecodeKind,
     /// The bytecode bytes.
     ///
     /// For legacy bytecode, this may be padded with zeros at the end.
-    /// For EIP-7702 bytecode, this is exactly 23 bytes.
+    /// For delegation bytecode, this is exactly 23 bytes.
     bytecode: Bytes,
     /// The original length of the bytecode before padding.
     ///
-    /// For EIP-7702 bytecode, this is always 23.
+    /// For delegation bytecode, this is always 23.
     original_len: usize,
-    /// The jump table for legacy bytecode. Empty for EIP-7702.
+    /// The jump table for legacy bytecode. Empty for delegation bytecode.
     jump_table: JumpTable,
     /// Cached hash of the original bytecode.
     #[cfg_attr(feature = "serde", serde(skip, default))]
@@ -55,6 +55,8 @@ pub enum BytecodeKind {
     LegacyAnalyzed,
     /// EIP-7702 delegated bytecode.
     Eip7702,
+    /// EIP-7851 ECDSA-disabled delegated bytecode.
+    Eip7851,
 }
 
 impl Default for Bytecode {
@@ -169,13 +171,32 @@ impl Bytecode {
         }))
     }
 
+    /// Creates a new EIP-7851 ECDSA-disabled [`Bytecode`] from [`Address`].
+    #[inline]
+    pub fn new_eip7851(address: Address) -> Self {
+        let raw: Bytes = [EIP7702_MAGIC_BYTES, &[EIP7851_VERSION], &address[..]]
+            .concat()
+            .into();
+        Self(Arc::new(BytecodeInner {
+            kind: BytecodeKind::Eip7851,
+            original_len: raw.len(),
+            bytecode: raw,
+            jump_table: JumpTable::default(),
+            hash: OnceLock::new(),
+        }))
+    }
+
     /// Creates a new raw [`Bytecode`].
     ///
     /// Returns an error on incorrect bytecode format.
     #[inline]
     pub fn new_raw_checked(bytes: Bytes) -> Result<Self, BytecodeDecodeError> {
         if bytes.starts_with(EIP7702_MAGIC_BYTES) {
-            Self::new_eip7702_raw(bytes).map_err(Into::into)
+            if bytes.get(2) == Some(&EIP7851_VERSION) {
+                Self::new_eip7851_raw(bytes).map_err(Into::into)
+            } else {
+                Self::new_eip7702_raw(bytes).map_err(Into::into)
+            }
         } else {
             Ok(Self::new_legacy(bytes))
         }
@@ -197,6 +218,29 @@ impl Bytecode {
         }
         Ok(Self(Arc::new(BytecodeInner {
             kind: BytecodeKind::Eip7702,
+            original_len: bytes.len(),
+            bytecode: bytes,
+            jump_table: JumpTable::default(),
+            hash: OnceLock::new(),
+        })))
+    }
+
+    /// Creates EIP-7851 ECDSA-disabled [`Bytecode`] from raw bytes.
+    ///
+    /// Returns an error unless the bytes are exactly `0xef0101 || address`.
+    #[inline]
+    pub fn new_eip7851_raw(bytes: Bytes) -> Result<Self, Eip7702DecodeError> {
+        if bytes.len() != 23 {
+            return Err(Eip7702DecodeError::InvalidLength);
+        }
+        if !bytes.starts_with(EIP7702_MAGIC_BYTES) {
+            return Err(Eip7702DecodeError::InvalidMagic);
+        }
+        if bytes[2] != EIP7851_VERSION {
+            return Err(Eip7702DecodeError::UnsupportedVersion);
+        }
+        Ok(Self(Arc::new(BytecodeInner {
+            kind: BytecodeKind::Eip7851,
             original_len: bytes.len(),
             bytecode: bytes,
             jump_table: JumpTable::default(),
@@ -269,10 +313,43 @@ impl Bytecode {
         self.kind() == BytecodeKind::Eip7702
     }
 
+    /// Returns `true` if bytecode is an EIP-7851 ECDSA-disabled designation.
+    #[inline]
+    pub fn is_eip7851(&self) -> bool {
+        self.kind() == BytecodeKind::Eip7851
+    }
+
+    /// Returns `true` for either supported delegation designation version.
+    #[inline]
+    pub fn is_delegation(&self) -> bool {
+        matches!(self.kind(), BytecodeKind::Eip7702 | BytecodeKind::Eip7851)
+    }
+
     /// Returns the EIP-7702 delegated address if this is EIP-7702 bytecode.
     #[inline]
     pub fn eip7702_address(&self) -> Option<Address> {
         if self.is_eip7702() {
+            Some(Address::from_slice(&self.0.bytecode[3..23]))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the EIP-7851 delegated address, keeping this predicate separate
+    /// from strict EIP-7702 authorization checks.
+    #[inline]
+    pub fn eip7851_address(&self) -> Option<Address> {
+        if self.is_eip7851() {
+            Some(Address::from_slice(&self.0.bytecode[3..23]))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the delegated address for either supported designation version.
+    #[inline]
+    pub fn delegated_address(&self) -> Option<Address> {
+        if self.is_delegation() {
             Some(Address::from_slice(&self.0.bytecode[3..23]))
         } else {
             None
@@ -300,7 +377,7 @@ impl Bytecode {
 
     /// Returns a reference to the bytecode bytes.
     ///
-    /// For legacy bytecode, this includes padding. For EIP-7702, this is the raw bytes.
+    /// For legacy bytecode, this includes padding. For delegation bytecode, this is the raw bytes.
     #[inline]
     pub fn bytecode(&self) -> &Bytes {
         &self.0.bytecode
@@ -472,6 +549,56 @@ mod tests {
     }
 
     #[test]
+    fn eip7851_exact_decode_keeps_strict_and_generic_predicates_separate() {
+        let raw = bytes!("ef0101deadbeef00000000000000000000000000000000");
+        let expected = Address::from_slice(&raw[3..]);
+
+        assert_eq!(
+            Bytecode::new_eip7702_raw(raw.clone()),
+            Err(Eip7702DecodeError::UnsupportedVersion)
+        );
+        let bytecode = Bytecode::new_raw_checked(raw.clone()).unwrap();
+        assert_eq!(bytecode.kind(), BytecodeKind::Eip7851);
+        assert!(!bytecode.is_eip7702());
+        assert!(bytecode.is_eip7851());
+        assert!(bytecode.is_delegation());
+        assert_eq!(bytecode.eip7702_address(), None);
+        assert_eq!(bytecode.eip7851_address(), Some(expected));
+        assert_eq!(bytecode.delegated_address(), Some(expected));
+        assert_eq!(bytecode.original_bytes(), raw);
+    }
+
+    #[test]
+    fn eip7851_constructor_and_malformed_inputs() {
+        let address = Address::new([0x42; 20]);
+        let bytecode = Bytecode::new_eip7851(address);
+        assert_eq!(bytecode.eip7851_address(), Some(address));
+        assert_eq!(
+            bytecode.original_bytes(),
+            bytes!("ef01014242424242424242424242424242424242424242")
+        );
+
+        assert_eq!(
+            Bytecode::new_eip7851_raw(bytes!("ef0101deadbeef")),
+            Err(Eip7702DecodeError::InvalidLength)
+        );
+        assert_eq!(
+            Bytecode::new_eip7851_raw(bytes!("ee0101deadbeef00000000000000000000000000000000")),
+            Err(Eip7702DecodeError::InvalidMagic)
+        );
+        assert_eq!(
+            Bytecode::new_eip7851_raw(bytes!("ef0100deadbeef00000000000000000000000000000000")),
+            Err(Eip7702DecodeError::UnsupportedVersion)
+        );
+        assert_eq!(
+            Bytecode::new_raw_checked(bytes!("ef0102deadbeef00000000000000000000000000000000")),
+            Err(BytecodeDecodeError::Eip7702(
+                Eip7702DecodeError::UnsupportedVersion
+            ))
+        );
+    }
+
+    #[test]
     fn eip7702_invalid_magic() {
         let raw1 = bytes!("ee0101deadbeef00000000000000000000000000000000");
         assert_eq!(
@@ -516,5 +643,21 @@ mod tests {
         let json = serde_json::to_string(&bc).unwrap();
         let deser: Bytecode = serde_json::from_str(&json).unwrap();
         assert!(deser.is_default());
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn delegation_serde_preserves_the_version() {
+        let address = Address::repeat_byte(0x23);
+        for (bytecode, variant) in [
+            (Bytecode::new_eip7702(address), "Eip7702"),
+            (Bytecode::new_eip7851(address), "Eip7851"),
+        ] {
+            let json = serde_json::to_string(&bytecode).unwrap();
+            assert!(json.contains(variant));
+            let decoded: Bytecode = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded.kind(), bytecode.kind());
+            assert_eq!(decoded.original_bytes(), bytecode.original_bytes());
+        }
     }
 }

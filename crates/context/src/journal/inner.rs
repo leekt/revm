@@ -23,7 +23,7 @@ use std::vec::Vec;
 
 /// Configuration for the journal that affects EVM execution behavior.
 ///
-/// This struct bundles the spec ID and EIP-7708 configuration flags.
+/// This struct bundles the spec ID and execution configuration flags.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct JournalCfg {
@@ -40,6 +40,9 @@ pub struct JournalCfg {
     /// [EIP-161]: https://eips.ethereum.org/EIPS/eip-161
     /// [EIP-6780]: https://eips.ethereum.org/EIPS/eip-6780
     pub spec: SpecId,
+    /// Whether EIP-7851 delegation resolution is enabled for this spec.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub eip7851_enabled: bool,
     /// Whether EIP-7708 (ETH transfers emit logs) is disabled.
     pub eip7708_disabled: bool,
     /// Whether the EIP-8246 delayed clearing of self-destructed accounts is disabled.
@@ -54,6 +57,27 @@ pub struct JournalCfg {
     /// [EIP-8246]: https://eips.ethereum.org/EIPS/eip-8246
     pub eip8246_delayed_clear_disabled: bool,
 }
+
+/// Retained journal metadata for one explicit outer frame transaction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[doc(hidden)]
+pub struct FrameTransactionJournal {
+    outer_checkpoint: Option<JournalCheckpoint>,
+    sender: Option<Address>,
+    current_call: Option<FrameTransactionCall>,
+    settled_state: EvmState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+struct FrameTransactionCall {
+    checkpoint: JournalCheckpoint,
+    state_baseline: EvmState,
+    log_baseline: usize,
+    is_static: bool,
+}
+
 /// Inner journal state that contains journal and state changes.
 ///
 /// Spec Id is a essential information for the Journal.
@@ -92,6 +116,10 @@ pub struct JournalInner<ENTRY> {
     ///
     /// [EIP-8246]: https://eips.ethereum.org/EIPS/eip-8246
     pub selfdestructed_addresses: Vec<Address>,
+    /// Explicit multi-frame transaction lifecycle metadata.
+    #[doc(hidden)]
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub frame_transaction: FrameTransactionJournal,
 }
 
 impl<ENTRY: JournalEntryTr> Default for JournalInner<ENTRY> {
@@ -116,7 +144,168 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             cfg: JournalCfg::default(),
             warm_addresses: WarmAddresses::new(),
             selfdestructed_addresses: Vec::new(),
+            frame_transaction: FrameTransactionJournal::default(),
         }
+    }
+
+    /// Begins one outer frame transaction and prewarms its declared sender.
+    pub fn begin_frame_transaction(&mut self, sender: Address) -> bool {
+        if self.frame_transaction.outer_checkpoint.is_some()
+            || self.depth != 0
+            || !self.journal.is_empty()
+            || !self.logs.is_empty()
+        {
+            return false;
+        }
+
+        self.warm_addresses.clear_coinbase_and_access_list();
+        self.warm_addresses.warm_address(sender);
+        let checkpoint = self.frame_transaction_checkpoint();
+        self.frame_transaction.outer_checkpoint = Some(checkpoint);
+        self.frame_transaction.sender = Some(sender);
+        true
+    }
+
+    /// Returns whether an outer frame transaction is active.
+    pub const fn is_frame_transaction_active(&self) -> bool {
+        self.frame_transaction.outer_checkpoint.is_some()
+    }
+
+    /// Latches and checkpoints one fully matched synthetic frame call.
+    pub fn begin_frame_transaction_call(&mut self, sender: Address, is_static: bool) -> bool {
+        if !self.is_frame_transaction_active()
+            || self.frame_transaction.sender != Some(sender)
+            || self.frame_transaction.current_call.is_some()
+            || !self.frame_transaction.settled_state.is_empty()
+        {
+            return false;
+        }
+
+        let state_baseline = self.state.clone();
+        let log_baseline = self.logs.len();
+        let checkpoint = self.frame_transaction_checkpoint();
+        self.frame_transaction.current_call = Some(FrameTransactionCall {
+            checkpoint,
+            state_baseline,
+            log_baseline,
+            is_static,
+        });
+        true
+    }
+
+    /// Returns whether the current synthetic call was latched.
+    pub const fn is_frame_transaction_call(&self) -> bool {
+        self.frame_transaction.current_call.is_some()
+    }
+
+    /// Returns whether the current latched call must be static.
+    pub fn frame_transaction_call_is_static(&self) -> bool {
+        self.frame_transaction
+            .current_call
+            .as_ref()
+            .is_some_and(|call| call.is_static)
+    }
+
+    /// Returns only logs emitted by the current frame.
+    pub fn frame_transaction_call_logs(&self) -> &[Log] {
+        let Some(call) = self.frame_transaction.current_call.as_ref() else {
+            return &[];
+        };
+        self.logs.get(call.log_baseline..).unwrap_or_default()
+    }
+
+    /// Settles the current frame checkpoint and stores a detached frame delta.
+    pub fn settle_frame_transaction_call(&mut self, success: bool) {
+        let Some(call) = self.frame_transaction.current_call.take() else {
+            return;
+        };
+
+        if success {
+            self.frame_transaction_checkpoint_commit();
+            self.frame_transaction.settled_state = self.state_delta(&call.state_baseline);
+        } else {
+            self.frame_transaction_checkpoint_revert(call.checkpoint);
+            self.frame_transaction.settled_state.clear();
+        }
+    }
+
+    /// Takes the last settled frame delta and clears frame-local transient storage.
+    pub fn finalize_frame_transaction_call(&mut self) -> EvmState {
+        self.transient_storage.clear();
+        mem::take(&mut self.frame_transaction.settled_state)
+    }
+
+    /// Finishes the outer transaction and returns cumulative state and logs.
+    pub fn finish_frame_transaction(&mut self) -> (EvmState, Vec<Log>) {
+        if !self.is_frame_transaction_active() {
+            return (EvmState::default(), Vec::new());
+        }
+        if self.frame_transaction.current_call.is_some() {
+            self.settle_frame_transaction_call(false);
+        }
+        self.frame_transaction_checkpoint_commit();
+        let logs = self.take_logs();
+        self.frame_transaction = FrameTransactionJournal::default();
+        let state = self.finalize();
+        (state, logs)
+    }
+
+    /// Reverts and fully resets an active outer frame transaction.
+    pub fn abort_frame_transaction(&mut self) {
+        let Some(outer_checkpoint) = self.frame_transaction.outer_checkpoint else {
+            return;
+        };
+        self.frame_transaction_checkpoint_revert(outer_checkpoint);
+        self.frame_transaction = FrameTransactionJournal::default();
+        self.discard_tx();
+        let _ = self.finalize();
+    }
+
+    fn state_delta(&self, baseline: &EvmState) -> EvmState {
+        let mut delta = EvmState::default();
+        for (address, current) in &self.state {
+            let before = baseline.get(address);
+            let original_info = before
+                .map(|account| account.info.clone())
+                .unwrap_or_else(|| current.original_info());
+            let was_touched = before.is_some_and(Account::is_touched);
+            let was_created = before.is_some_and(Account::is_created);
+            let was_destroyed = before.is_some_and(Account::is_selfdestructed);
+            let newly_created = current.is_created() && !was_created;
+            let storage_changed = current.storage.iter().any(|(key, slot)| {
+                let original = before
+                    .and_then(|account| account.storage.get(key))
+                    .map_or(slot.original_value, |slot| slot.present_value);
+                slot.present_value != original
+            });
+            if current.info == original_info
+                && !storage_changed
+                && !(current.is_touched() && !was_touched)
+                && !(current.is_created() && !was_created)
+                && !(current.is_selfdestructed() && !was_destroyed)
+            {
+                continue;
+            }
+
+            let mut account = current.clone();
+            account.original_info_mut().clone_from(&original_info);
+            if was_created {
+                account.unmark_created();
+                account.unmark_created_locally();
+            }
+            account.storage.retain(|key, slot| {
+                let original = before
+                    .and_then(|account| account.storage.get(key))
+                    .map_or(slot.original_value, |slot| slot.present_value);
+                let changed = newly_created || slot.present_value != original;
+                if changed {
+                    slot.original_value = original;
+                }
+                changed
+            });
+            delta.insert(*address, account);
+        }
+        delta
     }
 
     /// Returns the logs.
@@ -151,10 +340,12 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             cfg,
             warm_addresses,
             selfdestructed_addresses,
+            frame_transaction,
         } = self;
         // Cfg and state are not changed. They are always set again before execution.
         let _ = cfg;
         let _ = state;
+        let _ = frame_transaction;
         transient_storage.clear();
         *depth = 0;
 
@@ -183,6 +374,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             cfg,
             warm_addresses,
             selfdestructed_addresses,
+            frame_transaction,
         } = self;
         let is_spurious_dragon_enabled = cfg.spec.is_enabled_in(SPURIOUS_DRAGON);
         // iterate over all journals entries and revert our global state
@@ -193,6 +385,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         *depth = 0;
         logs.clear();
         selfdestructed_addresses.clear();
+        *frame_transaction = FrameTransactionJournal::default();
         transaction_id.increment();
 
         // Clear coinbase address warming for next tx
@@ -217,10 +410,12 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             cfg,
             warm_addresses,
             selfdestructed_addresses,
+            frame_transaction,
         } = self;
         // Clear coinbase address warming for next tx
         warm_addresses.clear_coinbase_and_access_list();
         selfdestructed_addresses.clear();
+        *frame_transaction = FrameTransactionJournal::default();
 
         let mut state = mem::take(state);
 
@@ -326,6 +521,12 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     #[inline]
     pub const fn set_spec_id(&mut self, spec: SpecId) {
         self.cfg.spec = spec;
+    }
+
+    /// Sets EIP-7851 delegation resolution.
+    #[inline]
+    pub const fn set_eip7851_enabled(&mut self, enabled: bool) {
+        self.cfg.eip7851_enabled = enabled;
     }
 
     /// Sets EIP-7708 and EIP-8246 configuration flags.
@@ -611,6 +812,26 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         checkpoint
     }
 
+    /// Creates a lifecycle checkpoint without changing EVM call depth.
+    #[inline]
+    pub const fn frame_transaction_checkpoint(&self) -> JournalCheckpoint {
+        JournalCheckpoint {
+            log_i: self.logs.len(),
+            journal_i: self.journal.len(),
+            selfdestructed_i: self.selfdestructed_addresses.len(),
+        }
+    }
+
+    /// Commits a lifecycle checkpoint without changing EVM call depth.
+    #[inline]
+    pub const fn frame_transaction_checkpoint_commit(&mut self) {}
+
+    /// Reverts a lifecycle checkpoint without changing EVM call depth.
+    #[inline]
+    pub fn frame_transaction_checkpoint_revert(&mut self, checkpoint: JournalCheckpoint) {
+        self.checkpoint_revert_inner(checkpoint);
+    }
+
     /// Commits the checkpoint.
     #[inline]
     pub const fn checkpoint_commit(&mut self) {
@@ -620,10 +841,14 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     /// Reverts all changes to state until given checkpoint.
     #[inline]
     pub fn checkpoint_revert(&mut self, checkpoint: JournalCheckpoint) {
+        self.depth = self.depth.saturating_sub(1);
+        self.checkpoint_revert_inner(checkpoint);
+    }
+
+    fn checkpoint_revert_inner(&mut self, checkpoint: JournalCheckpoint) {
         let is_spurious_dragon_enabled = self.cfg.spec.is_enabled_in(SPURIOUS_DRAGON);
         let state = &mut self.state;
         let transient_storage = &mut self.transient_storage;
-        self.depth = self.depth.saturating_sub(1);
         self.logs.truncate(checkpoint.log_i);
         // EIP-7708: Remove selfdestructed addresses added after checkpoint
         self.selfdestructed_addresses
@@ -783,6 +1008,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     ) -> Result<StateLoad<AccountLoad>, DB::Error> {
         let spec = self.cfg.spec;
         let is_eip7702_enabled = spec.is_enabled_in(SpecId::PRAGUE);
+        let is_eip7851_enabled = self.cfg.eip7851_enabled;
         let account = self
             .load_account_optional(db, address, is_eip7702_enabled, false)
             .map_err(JournalLoadError::unwrap_db_error)?;
@@ -796,13 +1022,18 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             account.is_cold,
         );
 
-        // load delegate code if account is EIP-7702
-        if let Some(address) = account
-            .info
-            .code
-            .as_ref()
-            .and_then(Bytecode::eip7702_address)
-        {
+        // EIP-7702 remains the strict default. EIP-7851 broadens execution
+        // resolution only under its explicit Prague-or-later opt-in.
+        let delegated_address = account.info.code.as_ref().and_then(|code| {
+            if is_eip7702_enabled && is_eip7851_enabled {
+                code.delegated_address()
+            } else if is_eip7702_enabled {
+                code.eip7702_address()
+            } else {
+                None
+            }
+        });
+        if let Some(address) = delegated_address {
             let delegate_account = self
                 .load_account_optional(db, address, true, false)
                 .map_err(JournalLoadError::unwrap_db_error)?;
@@ -1000,9 +1231,67 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         key: StorageKey,
         skip_cold_load: bool,
     ) -> Result<StateLoad<StorageValue>, JournalLoadError<DB::Error>> {
-        self.load_account_mut(db, address)?
-            .sload_concrete_error(key, skip_cold_load)
-            .map(|s| s.map(|s| s.present_value))
+        // Storage accesses have their own EIP-2929 access set. Loading the
+        // account record needed to reach a slot must not also warm the address.
+        let in_access_list = self
+            .warm_addresses
+            .access_list()
+            .get(&address)
+            .and_then(|keys| keys.get(&key))
+            .is_some();
+        let slot_is_cold = self
+            .state
+            .get(&address)
+            .and_then(|account| account.storage.get(&key))
+            .map_or(!in_access_list, |slot| {
+                slot.is_cold_transaction_id(self.transaction_id) && !in_access_list
+            });
+        if skip_cold_load && slot_is_cold {
+            return Err(JournalLoadError::ColdLoadSkipped);
+        }
+
+        let account = match self.state.entry(address) {
+            Entry::Occupied(entry) => {
+                let account = entry.into_mut();
+                if account.transaction_id != self.transaction_id {
+                    let account_is_cold = self.warm_addresses.is_cold(&address);
+                    account.mark_warm_with_transaction_id(self.transaction_id);
+                    if account_is_cold {
+                        account.mark_cold();
+                    }
+                    if account.is_selfdestructed_locally() {
+                        account.selfdestruct();
+                        account.unmark_selfdestructed_locally();
+                    }
+                    account.set_current_info_as_original();
+                    account.unmark_created_locally();
+                }
+                account
+            }
+            Entry::Vacant(entry) => {
+                let account_is_cold = self.warm_addresses.is_cold(&address);
+                let mut account = if let Some(account) = db.basic(address)? {
+                    Account::from(account)
+                } else {
+                    Account::new_not_existing(self.transaction_id)
+                };
+                account.transaction_id = self.transaction_id;
+                if account_is_cold {
+                    account.mark_cold();
+                }
+                entry.insert(account)
+            }
+        };
+        JournaledAccount::new(
+            address,
+            account,
+            &mut self.journal,
+            db,
+            self.warm_addresses.access_list(),
+            self.transaction_id,
+        )
+        .sload_concrete_error(key, skip_cold_load)
+        .map(|s| s.map(|s| s.present_value))
     }
 
     /// Loads storage slot.

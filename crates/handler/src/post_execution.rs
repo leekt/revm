@@ -136,11 +136,22 @@ pub fn output<CTX: ContextTr<Journal: JournalTr>, HALTREASON: HaltReasonTr>(
     result: FrameResult,
     result_gas: ResultGas,
 ) -> ExecutionResult<HALTREASON> {
+    let logs = context.journal_mut().take_logs();
+    output_with_logs(context, result, result_gas, logs)
+}
+
+/// Builds execution output from an explicit log snapshot.
+///
+/// Frame transactions use this path so cumulative outer-transaction logs stay
+/// in the journal until the outer lifecycle is finished.
+pub fn output_with_logs<CTX: ContextTr, HALTREASON: HaltReasonTr>(
+    context: &mut CTX,
+    result: FrameResult,
+    result_gas: ResultGas,
+    logs: Vec<primitives::Log>,
+) -> ExecutionResult<HALTREASON> {
     let output = result.output();
     let instruction_result = result.into_interpreter_result();
-
-    // take logs from journal.
-    let logs = context.journal_mut().take_logs();
 
     match SuccessOrHalt::<HALTREASON>::from(instruction_result.result) {
         SuccessOrHalt::Success(reason) => ExecutionResult::Success {

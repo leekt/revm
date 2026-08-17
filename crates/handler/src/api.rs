@@ -222,7 +222,12 @@ where
 
     #[inline]
     fn finalize(&mut self) -> Self::State {
-        self.journal_mut().finalize()
+        let journal = self.journal_mut();
+        if journal.is_frame_transaction_active() {
+            journal.finalize_frame_transaction_call()
+        } else {
+            journal.finalize()
+        }
     }
 
     #[inline]
