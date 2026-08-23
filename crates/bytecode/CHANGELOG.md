@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [42.1.0](https://github.com/leekt/revm/compare/revm-bytecode-v42.0.0...revm-bytecode-v42.1.0) - 2026-08-23
+
+### Added
+
+- execute experimental EVM proposals
+- add EIP-8141 frame transaction opcodes
+
+### Other
+
+- account for the six new opcodes in the bytecode tests
+
 ## [41.0.1](https://github.com/bluealloy/revm/compare/revm-bytecode-v41.0.0...revm-bytecode-v41.0.1) - 2026-07-22
 
 ### Fixed

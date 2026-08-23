@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [42.1.0](https://github.com/leekt/revm/compare/revm-context-v42.0.0...revm-context-v42.1.0) - 2026-08-23
+
+### Added
+
+- adopt EIP-8141 master-spec introspection surface
+- execute experimental EVM proposals
+- expose the frame transaction context through TxEnv and Host
+- add EIP-8141 frame transaction opcodes
+- *(journal)* finalize selfdestructed accounts in place from Cancun ([#3863](https://github.com/leekt/revm/pull/3863))
+- glamsterdam devnet-8 gas repricing ([#3850](https://github.com/leekt/revm/pull/3850))
+- add async database fiber support ([#3709](https://github.com/leekt/revm/pull/3709))
+
+### Fixed
+
+- check call depth in CREATE pre-access checks (EIP-8037) ([#3829](https://github.com/leekt/revm/pull/3829))
+
+### Other
+
+- align frame adapter after upstream rebase
+- supply the frame context without changing shared revm types
+- return the frame context by value to avoid lifetime coupling
+- remove duplicate Amsterdam gas overrides and dead CPSB constants ([#3857](https://github.com/leekt/revm/pull/3857))
+
 ## [42.0.0](https://github.com/bluealloy/revm/compare/revm-context-v41.0.0...revm-context-v42.0.0) - 2026-07-22
 
 ### Added
