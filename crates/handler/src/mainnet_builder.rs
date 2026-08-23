@@ -1063,7 +1063,7 @@ mod test {
     }
 
     #[test]
-    fn created_local_survives_frame_finalize_for_later_eip6780_selfdestruct() {
+    fn created_local_survives_between_frames_for_later_eip6780_selfdestruct() {
         let factory = address!("1000000000000000000000000000000000000071");
         let beneficiary = address!("1000000000000000000000000000000000000072");
         let factory_nonce = 1;
@@ -1147,8 +1147,10 @@ mod test {
         }
 
         let (state, _) = evm.ctx.journal_mut().finish_frame_transaction();
-        assert!(state[&created].is_created());
-        assert!(state[&created].is_selfdestructed());
+        let finalized = &state[&created];
+        assert!(!finalized.is_created());
+        assert!(!finalized.is_selfdestructed());
+        assert!(finalized.info.is_empty());
     }
 
     #[test]
@@ -1669,7 +1671,7 @@ mod test {
     }
 
     #[test]
-    fn frame_context_accepts_bound_blob_transaction_metadata() {
+    fn frame_context_accepts_matching_blob_count_and_fee_metadata() {
         let gas_limit = 2_600;
         let mut blob_hash = [0u8; 32];
         blob_hash[0] = 1;

@@ -37,8 +37,9 @@ pub enum SetDelegateError {
 /// `EVENTDATACOPY`) read from this context; outside a frame transaction it is
 /// absent and those opcodes halt exceptionally.
 ///
-/// This context does not carry a chain ID. Lifecycle callers must validate the
-/// synthetic transaction's chain ID against the outer transaction externally.
+/// This context carries only the blob count, not the versioned hashes, and no
+/// chain ID. Lifecycle callers must bind the synthetic transaction's exact
+/// versioned hashes and chain ID to the validated outer transaction externally.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FrameTxContext {
@@ -220,7 +221,9 @@ pub struct FrameSigInfo {
     /// Signer after resolving an absent signer to `tx.sender`. `None` for
     /// `ARBITRARY` entries, which have no protocol-assigned signer.
     pub resolved_signer: Option<Address>,
-    /// Signature scheme: 0 ARBITRARY, 1 SECP256K1, 2 P256.
+    /// Signature scheme exposed by the outer executor. EIP-8141 assigns
+    /// 0 ARBITRARY, 1 SECP256K1 and 2 P256; any executor-local native extension
+    /// remains opaque here just like every other non-ARBITRARY entry.
     pub scheme: u8,
     /// Explicit 32-byte digest, or zero when the entry signs the canonical hash.
     pub msg: B256,

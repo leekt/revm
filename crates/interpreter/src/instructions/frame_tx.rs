@@ -453,8 +453,9 @@ pub fn sigparam<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
         0x01 => U256::from(sig.scheme),
         0x02 => U256::from_be_bytes(sig.msg.0),
         0x03 => {
-            // Raw bytes of protocol-validated schemes are not introspectable,
-            // including their length (EIPs PR 12187).
+            // Raw bytes of every non-ARBITRARY scheme are not introspectable,
+            // including their length (EIPs PR 12187). Envelope validation is
+            // responsible for rejecting reserved scheme IDs.
             if sig.scheme != SCHEME_ARBITRARY {
                 return Err(InstructionResult::InvalidFEOpcode);
             }
@@ -1295,12 +1296,18 @@ mod tests {
         }
     }
 
-    /// The signature length is ARBITRARY-only: raw bytes of protocol-validated
-    /// schemes, including their length, are not introspectable (EIPs PR 12187).
+    /// The signature length is ARBITRARY-only: raw bytes of every other scheme,
+    /// including an executor-local native extension, are not introspectable.
     #[test]
     fn sigparam_length_is_arbitrary_only() {
-        let mut host =
-            DummyHost::new(SpecId::default()).with_frame_tx(ctx_with_arbitrary_signature(), 0x3);
+        let mut context = ctx_with_arbitrary_signature();
+        context.signatures.push(FrameSigInfo {
+            resolved_signer: Some(Address::repeat_byte(0x55)),
+            scheme: 0x03,
+            signature: Bytes::from_static(&[0x44; 32]),
+            ..Default::default()
+        });
+        let mut host = DummyHost::new(SpecId::default()).with_frame_tx(context, 0x3);
         // Entry 1 is ARBITRARY with 3 raw bytes.
         let mut interpreter = Interpreter::default();
         let _ = interpreter.stack.push(U256::from(0x03u64));
@@ -1311,17 +1318,22 @@ mod tests {
         })
         .unwrap();
         assert_eq!(interpreter.stack.data()[0], U256::from(3u64));
-        // Entry 0 is SECP256K1: halt.
-        let mut interpreter = Interpreter::default();
-        let _ = interpreter.stack.push(U256::from(0x03u64));
-        let _ = interpreter.stack.push(U256::ZERO);
-        assert_eq!(
-            sigparam(Ictx {
-                interpreter: &mut interpreter,
-                host: &mut host
-            }),
-            Err(InstructionResult::InvalidFEOpcode)
-        );
+        // Both an assigned native scheme and an executor-local extension are
+        // opaque. Official EIP-8141 envelope validation rejects the reserved
+        // 0x03 scheme before execution; the host boundary still fails closed if
+        // a local executor uses it.
+        for index in [0u64, 2] {
+            let mut interpreter = Interpreter::default();
+            let _ = interpreter.stack.push(U256::from(0x03u64));
+            let _ = interpreter.stack.push(U256::from(index));
+            assert_eq!(
+                sigparam(Ictx {
+                    interpreter: &mut interpreter,
+                    host: &mut host
+                }),
+                Err(InstructionResult::InvalidFEOpcode)
+            );
+        }
     }
 
     #[test]
@@ -1351,8 +1363,11 @@ mod tests {
 
     #[test]
     fn sigdatacopy_rejects_invalid_signature_entries() {
+        let mut extension = ctx();
+        extension.signatures[0].scheme = 0x03;
         for (case, frame, sig_index) in [
             ("non-ARBITRARY", ctx(), U256::ZERO),
+            ("executor-local non-ARBITRARY", extension, U256::ZERO),
             (
                 "out-of-bounds index",
                 ctx_with_arbitrary_signature(),
