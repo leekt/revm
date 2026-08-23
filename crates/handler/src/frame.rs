@@ -211,6 +211,7 @@ impl EthFrame<EthInterpreter> {
             bytecode_address: Some(inputs.bytecode_address),
             input: inputs.input.clone(),
             call_value: inputs.value.get(),
+            depth,
         };
         let gas_limit = inputs.gas_limit;
 
@@ -352,6 +353,7 @@ impl EthFrame<EthInterpreter> {
             bytecode_address: None,
             input: CallInput::Bytes(Bytes::new()),
             call_value: inputs.value(),
+            depth,
         };
         let gas_limit = inputs.gas_limit();
 

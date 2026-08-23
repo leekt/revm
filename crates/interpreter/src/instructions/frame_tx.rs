@@ -297,11 +297,14 @@ pub fn txparam<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
         0x09 => U256::from(frame.frames.len() as u64),
         0x0A => U256::from(frame.frame_index),
         0x0B => U256::from(frame.signatures.len() as u64),
-        0x0C => U256::from(frame.legacy_nonce),
-        0x0D => U256::from(frame.nonce_keys.len() as u64),
-        0x0E => U256::from_be_bytes(frame.nonce_keys_hash.0),
-        0x0F => U256::from(frame.recent_root_references.len() as u64),
-        0x10 => frame
+        0x0C => U256::from(frame.state_gas_left),
+        // Fixture selectors live at 0x80+ so newly assigned normative
+        // selectors never collide with them; 0x0D-0x7F halt as undefined.
+        0x80 => U256::from(frame.legacy_nonce),
+        0x81 => U256::from(frame.nonce_keys.len() as u64),
+        0x82 => U256::from_be_bytes(frame.nonce_keys_hash.0),
+        0x83 => U256::from(frame.recent_root_references.len() as u64),
+        0x84 => frame
             .nonce_keys
             .first()
             .copied()
@@ -404,6 +407,20 @@ pub fn frameparam<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result
         0x06 => U256::from(info.flags & 0x03),
         0x07 => U256::from((info.flags >> 2) & 0x01),
         0x08 => info.value,
+        0x09 => U256::from(info.state_gas_limit),
+        0x0A => {
+            // Receipt gas of the current or a later frame does not exist yet.
+            if frame_index >= U256::from(frame.frame_index) {
+                return Err(InstructionResult::InvalidFEOpcode);
+            }
+            U256::from(info.execution_gas_used)
+        }
+        0x0B => {
+            if frame_index >= U256::from(frame.frame_index) {
+                return Err(InstructionResult::InvalidFEOpcode);
+            }
+            U256::from(info.state_gas_used)
+        }
         _ => return Err(InstructionResult::InvalidFEOpcode),
     };
     Ok(())
@@ -435,7 +452,15 @@ pub fn sigparam<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
         },
         0x01 => U256::from(sig.scheme),
         0x02 => U256::from_be_bytes(sig.msg.0),
-        0x03 => U256::from(sig.signature.len() as u64),
+        0x03 => {
+            // Raw bytes of every non-ARBITRARY scheme are not introspectable,
+            // including their length (EIPs PR 12187). Envelope validation is
+            // responsible for rejecting reserved scheme IDs.
+            if sig.scheme != SCHEME_ARBITRARY {
+                return Err(InstructionResult::InvalidFEOpcode);
+            }
+            U256::from(sig.signature.len() as u64)
+        }
         _ => return Err(InstructionResult::InvalidFEOpcode),
     };
     Ok(())
@@ -889,20 +914,25 @@ mod tests {
             nonce_keys_hash: B256::repeat_byte(0xE1),
             sig_hash: B256::repeat_byte(0xAB),
             max_cost: U256::from(1234u64),
+            state_gas_left: 40_000,
             frame_index: 1,
             frames: vec![
                 FrameInfo {
                     resolved_target: address!("2222222222222222222222222222222222222222"),
                     gas_limit: 50_000,
+                    state_gas_limit: 12_000,
                     mode: 1,
                     flags: 0x3,
                     status: 1,
+                    execution_gas_used: 21_000,
+                    state_gas_used: 5_000,
                     data: Bytes::from_static(&[0xde, 0xad]),
                     ..Default::default()
                 },
                 FrameInfo {
                     resolved_target: address!("3333333333333333333333333333333333333333"),
                     gas_limit: 100_000,
+                    state_gas_limit: 60_000,
                     mode: 2,
                     ..Default::default()
                 },
@@ -1073,14 +1103,15 @@ mod tests {
             (0x00u64, U256::from(0x06u8)),
             (0x01, U256::from(7u64)),
             (0x07, U256::ZERO),
-            (0x09, U256::from(2u64)), // frame count
-            (0x0A, U256::from(1u64)), // current frame index
-            (0x0B, U256::from(1u64)), // signature count
-            (0x0C, U256::from(9u64)),
-            (0x0D, U256::from(2u64)),
-            (0x0E, U256::from_be_bytes([0xE1; 32])),
-            (0x0F, U256::from(1u64)),
-            (0x10, U256::from(3u64)),
+            (0x09, U256::from(2u64)),      // frame count
+            (0x0A, U256::from(1u64)),      // current frame index
+            (0x0B, U256::from(1u64)),      // signature count
+            (0x0C, U256::from(40_000u64)), // state_gas_left
+            (0x80, U256::from(9u64)),      // fixture legacy nonce
+            (0x81, U256::from(2u64)),
+            (0x82, U256::from_be_bytes([0xE1; 32])),
+            (0x83, U256::from(1u64)),
+            (0x84, U256::from(3u64)),
         ] {
             let mut interpreter = Interpreter::default();
             let _ = interpreter.stack.push(U256::from(param));
@@ -1091,8 +1122,9 @@ mod tests {
             .unwrap();
             assert_eq!(interpreter.stack.data()[0], want, "TXPARAM({param:#x})");
         }
-        // 0x11 and all later unassigned parameters are undefined.
-        for param in [0x11u64, 0xFF] {
+        // Everything between the normative table and the 0x80+ fixture block,
+        // and everything after the fixture block, is undefined.
+        for param in [0x0Du64, 0x10, 0x7F, 0x85, 0xFF] {
             let mut interpreter = Interpreter::default();
             let _ = interpreter.stack.push(U256::from(param));
             assert_eq!(
@@ -1109,7 +1141,7 @@ mod tests {
         empty_keys.nonce_keys.clear();
         let mut host = DummyHost::new(SpecId::default()).with_frame_tx(empty_keys, 0x3);
         let mut interpreter = Interpreter::default();
-        let _ = interpreter.stack.push(U256::from(0x10u64));
+        let _ = interpreter.stack.push(U256::from(0x84u64));
         assert_eq!(
             txparam(Ictx {
                 interpreter: &mut interpreter,
@@ -1189,6 +1221,43 @@ mod tests {
         );
     }
 
+    /// `limits.state` reads for any frame; the receipt gas selectors follow the
+    /// same past-frames-only rule as `status`.
+    #[test]
+    fn frameparam_reads_state_limits_and_receipt_gas() {
+        let mut host = DummyHost::new(SpecId::default()).with_frame_tx(ctx(), 0x3);
+        for (param, index, want) in [
+            (0x09u64, 1u64, U256::from(60_000u64)), // current frame's limits.state
+            (0x09, 0, U256::from(12_000u64)),
+            (0x0A, 0, U256::from(21_000u64)), // past frame's gas_used.execution
+            (0x0B, 0, U256::from(5_000u64)),  // past frame's gas_used.state
+        ] {
+            let mut interpreter = Interpreter::default();
+            let _ = interpreter.stack.push(U256::from(param));
+            let _ = interpreter.stack.push(U256::from(index));
+            frameparam(Ictx {
+                interpreter: &mut interpreter,
+                host: &mut host,
+            })
+            .unwrap();
+            assert_eq!(interpreter.stack.data()[0], want, "FRAMEPARAM({param:#x})");
+        }
+        // Receipt gas of the current frame does not exist yet.
+        for param in [0x0Au64, 0x0B] {
+            let mut interpreter = Interpreter::default();
+            let _ = interpreter.stack.push(U256::from(param));
+            let _ = interpreter.stack.push(U256::from(1u64));
+            assert_eq!(
+                frameparam(Ictx {
+                    interpreter: &mut interpreter,
+                    host: &mut host
+                }),
+                Err(InstructionResult::InvalidFEOpcode),
+                "FRAMEPARAM({param:#x})"
+            );
+        }
+    }
+
     #[test]
     fn sigparam_rejects_removed_copy_param() {
         let mut host = DummyHost::new(SpecId::default()).with_frame_tx(ctx(), 0x3);
@@ -1214,7 +1283,6 @@ mod tests {
             (0x00u64, signer),
             (0x01, U256::from(1u64)),
             (0x02, U256::from_be_bytes([0xCD; 32])),
-            (0x03, U256::from(2u64)),
         ] {
             let mut interpreter = Interpreter::default();
             let _ = interpreter.stack.push(U256::from(param));
@@ -1225,6 +1293,46 @@ mod tests {
             })
             .unwrap();
             assert_eq!(interpreter.stack.data()[0], want, "SIGPARAM({param:#x})");
+        }
+    }
+
+    /// The signature length is ARBITRARY-only: raw bytes of every other scheme,
+    /// including an executor-local native extension, are not introspectable.
+    #[test]
+    fn sigparam_length_is_arbitrary_only() {
+        let mut context = ctx_with_arbitrary_signature();
+        context.signatures.push(FrameSigInfo {
+            resolved_signer: Some(Address::repeat_byte(0x55)),
+            scheme: 0x03,
+            signature: Bytes::from_static(&[0x44; 32]),
+            ..Default::default()
+        });
+        let mut host = DummyHost::new(SpecId::default()).with_frame_tx(context, 0x3);
+        // Entry 1 is ARBITRARY with 3 raw bytes.
+        let mut interpreter = Interpreter::default();
+        let _ = interpreter.stack.push(U256::from(0x03u64));
+        let _ = interpreter.stack.push(U256::from(1u64));
+        sigparam(Ictx {
+            interpreter: &mut interpreter,
+            host: &mut host,
+        })
+        .unwrap();
+        assert_eq!(interpreter.stack.data()[0], U256::from(3u64));
+        // Both an assigned native scheme and an executor-local extension are
+        // opaque. Official EIP-8141 envelope validation rejects the reserved
+        // 0x03 scheme before execution; the host boundary still fails closed if
+        // a local executor uses it.
+        for index in [0u64, 2] {
+            let mut interpreter = Interpreter::default();
+            let _ = interpreter.stack.push(U256::from(0x03u64));
+            let _ = interpreter.stack.push(U256::from(index));
+            assert_eq!(
+                sigparam(Ictx {
+                    interpreter: &mut interpreter,
+                    host: &mut host
+                }),
+                Err(InstructionResult::InvalidFEOpcode)
+            );
         }
     }
 
@@ -1255,8 +1363,11 @@ mod tests {
 
     #[test]
     fn sigdatacopy_rejects_invalid_signature_entries() {
+        let mut extension = ctx();
+        extension.signatures[0].scheme = 0x03;
         for (case, frame, sig_index) in [
             ("non-ARBITRARY", ctx(), U256::ZERO),
+            ("executor-local non-ARBITRARY", extension, U256::ZERO),
             (
                 "out-of-bounds index",
                 ctx_with_arbitrary_signature(),

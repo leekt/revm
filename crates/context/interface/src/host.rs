@@ -37,8 +37,9 @@ pub enum SetDelegateError {
 /// `EVENTDATACOPY`) read from this context; outside a frame transaction it is
 /// absent and those opcodes halt exceptionally.
 ///
-/// This context does not carry a chain ID. Lifecycle callers must validate the
-/// synthetic transaction's chain ID against the outer transaction externally.
+/// This context carries only the blob count, not the versioned hashes, and no
+/// chain ID. Lifecycle callers must bind the synthetic transaction's exact
+/// versioned hashes and chain ID to the validated outer transaction externally.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FrameTxContext {
@@ -47,13 +48,15 @@ pub struct FrameTxContext {
     /// Shared keyed-nonce sequence, `TXPARAM(0x01)`.
     pub nonce: u64,
     /// Sender's legacy account nonce in the transaction pre-state,
-    /// `TXPARAM(0x0C)`.
+    /// fixture `TXPARAM(0x80)`.
     pub legacy_nonce: u64,
-    /// Canonically ordered EIP-8250 nonce keys. Their count is
-    /// `TXPARAM(0x0D)` and the first key is `TXPARAM(0x10)`.
+    /// Canonically ordered EIP-8250 nonce keys. Their count is fixture
+    /// `TXPARAM(0x81)` and the first key is fixture `TXPARAM(0x84)`.
     pub nonce_keys: Vec<U256>,
-    /// Canonical hash of `nonce_keys`, `TXPARAM(0x0E)`.
+    /// Canonical hash of `nonce_keys`, fixture `TXPARAM(0x82)`.
     pub nonce_keys_hash: B256,
+    /// State gas remaining in the currently executing frame, `TXPARAM(0x0C)`.
+    pub state_gas_left: u64,
     /// Canonical signature hash, `TXPARAM(0x08)`.
     pub sig_hash: B256,
     /// Maximum cost the payer may be charged, `TXPARAM(0x06)`.
@@ -73,7 +76,7 @@ pub struct FrameTxContext {
     /// Every signature entry in the transaction, in order.
     pub signatures: Vec<FrameSigInfo>,
     /// Verified recent-root references in transaction order. Their count is
-    /// `TXPARAM(0x0F)`.
+    /// fixture `TXPARAM(0x83)`.
     pub recent_root_references: Vec<FrameTxRecentRootReference>,
     /// Transaction-local state diff and event trace as of the current frame.
     pub trace: FrameTxTrace,
@@ -183,8 +186,13 @@ pub struct FrameInfo {
     /// metadata and is not exposed through `FRAMEPARAM`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub expected_caller: Address,
-    /// Gas limit allotted to this frame.
+    /// Execution gas limit allotted to this frame (`limits.execution`),
+    /// `FRAMEPARAM(0x01)`.
     pub gas_limit: u64,
+    /// State gas limit allotted to this frame (`limits.state`),
+    /// `FRAMEPARAM(0x09)`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub state_gas_limit: u64,
     /// Frame mode: 0 DEFAULT, 1 VERIFY, 2 SENDER, 3 POST_TX.
     pub mode: u8,
     /// Frame flags.
@@ -194,6 +202,14 @@ pub struct FrameInfo {
     /// Execution status: 0 failed, 1 success, 2 skipped. Only meaningful for a
     /// frame that has already run.
     pub status: u8,
+    /// Execution gas recorded in the frame's receipt (`gas_used.execution`),
+    /// `FRAMEPARAM(0x0A)`. Only meaningful for a frame that has already run.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub execution_gas_used: u64,
+    /// State gas attributed to the frame's receipt (`gas_used.state`),
+    /// `FRAMEPARAM(0x0B)`. Only meaningful for a frame that has already run.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub state_gas_used: u64,
     /// Calldata supplied to the frame.
     pub data: Bytes,
 }
@@ -205,7 +221,9 @@ pub struct FrameSigInfo {
     /// Signer after resolving an absent signer to `tx.sender`. `None` for
     /// `ARBITRARY` entries, which have no protocol-assigned signer.
     pub resolved_signer: Option<Address>,
-    /// Signature scheme: 0 ARBITRARY, 1 SECP256K1, 2 P256.
+    /// Signature scheme exposed by the outer executor. EIP-8141 assigns
+    /// 0 ARBITRARY, 1 SECP256K1 and 2 P256; any executor-local native extension
+    /// remains opaque here just like every other non-ARBITRARY entry.
     pub scheme: u8,
     /// Explicit 32-byte digest, or zero when the entry signs the canonical hash.
     pub msg: B256,
@@ -656,7 +674,7 @@ impl Host for DummyHost {
     }
 
     fn is_amsterdam_eip8037_enabled(&self) -> bool {
-        false
+        self.spec_id.is_enabled_in(SpecId::AMSTERDAM)
     }
 
     fn is_eip7819_enabled(&self) -> bool {
