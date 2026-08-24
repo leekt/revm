@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [42.1.0](https://github.com/leekt/revm/compare/revm-interpreter-v42.0.0...revm-interpreter-v42.1.0) - 2026-08-24
+
+### Added
+
+- adopt EIP-8141 master-spec introspection surface
+- execute experimental EVM proposals
+- add EIP-8141 frame transaction opcodes
+
+### Fixed
+
+- *(frame-tx)* remove nonstandard tx params
+- *(interpreter)* return MemoryOOG when memory resize fails ([#3864](https://github.com/leekt/revm/pull/3864))
+- check call depth in CREATE pre-access checks (EIP-8037) ([#3829](https://github.com/leekt/revm/pull/3829))
+
+### Other
+
+- align frame adapter after upstream rebase
+- supply the frame context without changing shared revm types
+- return the frame context by value to avoid lifetime coupling
+
 ## [42.0.0](https://github.com/bluealloy/revm/compare/revm-interpreter-v41.0.0...revm-interpreter-v42.0.0) - 2026-07-22
 
 ### Added

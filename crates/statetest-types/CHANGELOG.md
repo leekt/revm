@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [42.1.0](https://github.com/leekt/revm/compare/revm-statetest-types-v42.0.0...revm-statetest-types-v42.1.0) - 2026-08-24
+
+### Added
+
+- execute experimental EVM proposals
+
 ## [42.0.0](https://github.com/bluealloy/revm/compare/revm-statetest-types-v41.0.0...revm-statetest-types-v42.0.0) - 2026-07-22
 
 ### Added
