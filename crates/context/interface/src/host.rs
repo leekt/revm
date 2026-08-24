@@ -45,16 +45,8 @@ pub enum SetDelegateError {
 pub struct FrameTxContext {
     /// The declared sender of the transaction.
     pub sender: Address,
-    /// Shared keyed-nonce sequence, `TXPARAM(0x01)`.
+    /// Transaction's scalar wire nonce, `TXPARAM(0x01)`.
     pub nonce: u64,
-    /// Sender's legacy account nonce in the transaction pre-state,
-    /// fixture `TXPARAM(0x80)`.
-    pub legacy_nonce: u64,
-    /// Canonically ordered EIP-8250 nonce keys. Their count is fixture
-    /// `TXPARAM(0x81)` and the first key is fixture `TXPARAM(0x84)`.
-    pub nonce_keys: Vec<U256>,
-    /// Canonical hash of `nonce_keys`, fixture `TXPARAM(0x82)`.
-    pub nonce_keys_hash: B256,
     /// State gas remaining in the currently executing frame, `TXPARAM(0x0C)`.
     pub state_gas_left: u64,
     /// Canonical signature hash, `TXPARAM(0x08)`.
@@ -75,8 +67,7 @@ pub struct FrameTxContext {
     pub frames: Vec<FrameInfo>,
     /// Every signature entry in the transaction, in order.
     pub signatures: Vec<FrameSigInfo>,
-    /// Verified recent-root references in transaction order. Their count is
-    /// fixture `TXPARAM(0x83)`.
+    /// Verified recent-root references in transaction order.
     pub recent_root_references: Vec<FrameTxRecentRootReference>,
     /// Transaction-local state diff and event trace as of the current frame.
     pub trace: FrameTxTrace,
@@ -222,8 +213,8 @@ pub struct FrameSigInfo {
     /// `ARBITRARY` entries, which have no protocol-assigned signer.
     pub resolved_signer: Option<Address>,
     /// Signature scheme exposed by the outer executor. EIP-8141 assigns
-    /// 0 ARBITRARY, 1 SECP256K1 and 2 P256; any executor-local native extension
-    /// remains opaque here just like every other non-ARBITRARY entry.
+    /// 0 ARBITRARY, 1 SECP256K1 and 2 P256. The outer executor must reject every
+    /// other value before installing this context.
     pub scheme: u8,
     /// Explicit 32-byte digest, or zero when the entry signs the canonical hash.
     pub msg: B256,

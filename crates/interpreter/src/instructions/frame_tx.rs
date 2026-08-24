@@ -298,17 +298,6 @@ pub fn txparam<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
         0x0A => U256::from(frame.frame_index),
         0x0B => U256::from(frame.signatures.len() as u64),
         0x0C => U256::from(frame.state_gas_left),
-        // Fixture selectors live at 0x80+ so newly assigned normative
-        // selectors never collide with them; 0x0D-0x7F halt as undefined.
-        0x80 => U256::from(frame.legacy_nonce),
-        0x81 => U256::from(frame.nonce_keys.len() as u64),
-        0x82 => U256::from_be_bytes(frame.nonce_keys_hash.0),
-        0x83 => U256::from(frame.recent_root_references.len() as u64),
-        0x84 => frame
-            .nonce_keys
-            .first()
-            .copied()
-            .ok_or(InstructionResult::InvalidFEOpcode)?,
         _ => return Err(InstructionResult::InvalidFEOpcode),
     };
     Ok(())
@@ -454,8 +443,8 @@ pub fn sigparam<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
         0x02 => U256::from_be_bytes(sig.msg.0),
         0x03 => {
             // Raw bytes of every non-ARBITRARY scheme are not introspectable,
-            // including their length (EIPs PR 12187). Envelope validation is
-            // responsible for rejecting reserved scheme IDs.
+            // including their length (EIPs PR 12187). Envelope validation must
+            // reject every scheme other than ARBITRARY, SECP256K1 and P256.
             if sig.scheme != SCHEME_ARBITRARY {
                 return Err(InstructionResult::InvalidFEOpcode);
             }
@@ -909,9 +898,6 @@ mod tests {
         FrameTxContext {
             sender: address!("1111111111111111111111111111111111111111"),
             nonce: 7,
-            legacy_nonce: 9,
-            nonce_keys: vec![U256::from(3u64), U256::from(7u64)],
-            nonce_keys_hash: B256::repeat_byte(0xE1),
             sig_hash: B256::repeat_byte(0xAB),
             max_cost: U256::from(1234u64),
             state_gas_left: 40_000,
@@ -1107,11 +1093,6 @@ mod tests {
             (0x0A, U256::from(1u64)),      // current frame index
             (0x0B, U256::from(1u64)),      // signature count
             (0x0C, U256::from(40_000u64)), // state_gas_left
-            (0x80, U256::from(9u64)),      // fixture legacy nonce
-            (0x81, U256::from(2u64)),
-            (0x82, U256::from_be_bytes([0xE1; 32])),
-            (0x83, U256::from(1u64)),
-            (0x84, U256::from(3u64)),
         ] {
             let mut interpreter = Interpreter::default();
             let _ = interpreter.stack.push(U256::from(param));
@@ -1122,9 +1103,8 @@ mod tests {
             .unwrap();
             assert_eq!(interpreter.stack.data()[0], want, "TXPARAM({param:#x})");
         }
-        // Everything between the normative table and the 0x80+ fixture block,
-        // and everything after the fixture block, is undefined.
-        for param in [0x0Du64, 0x10, 0x7F, 0x85, 0xFF] {
+        // Every selector outside the normative table is undefined.
+        for param in 0x0Du64..=0xFF {
             let mut interpreter = Interpreter::default();
             let _ = interpreter.stack.push(U256::from(param));
             assert_eq!(
@@ -1136,19 +1116,6 @@ mod tests {
                 "TXPARAM({param:#x})"
             );
         }
-
-        let mut empty_keys = ctx();
-        empty_keys.nonce_keys.clear();
-        let mut host = DummyHost::new(SpecId::default()).with_frame_tx(empty_keys, 0x3);
-        let mut interpreter = Interpreter::default();
-        let _ = interpreter.stack.push(U256::from(0x84u64));
-        assert_eq!(
-            txparam(Ictx {
-                interpreter: &mut interpreter,
-                host: &mut host
-            }),
-            Err(InstructionResult::InvalidFEOpcode)
-        );
     }
 
     /// A frame index beyond the native pointer width must halt, not truncate to
@@ -1296,18 +1263,12 @@ mod tests {
         }
     }
 
-    /// The signature length is ARBITRARY-only: raw bytes of every other scheme,
-    /// including an executor-local native extension, are not introspectable.
+    /// The signature length is ARBITRARY-only: raw bytes of the protocol's
+    /// assigned cryptographic schemes are not introspectable.
     #[test]
     fn sigparam_length_is_arbitrary_only() {
-        let mut context = ctx_with_arbitrary_signature();
-        context.signatures.push(FrameSigInfo {
-            resolved_signer: Some(Address::repeat_byte(0x55)),
-            scheme: 0x03,
-            signature: Bytes::from_static(&[0x44; 32]),
-            ..Default::default()
-        });
-        let mut host = DummyHost::new(SpecId::default()).with_frame_tx(context, 0x3);
+        let mut host =
+            DummyHost::new(SpecId::default()).with_frame_tx(ctx_with_arbitrary_signature(), 0x3);
         // Entry 1 is ARBITRARY with 3 raw bytes.
         let mut interpreter = Interpreter::default();
         let _ = interpreter.stack.push(U256::from(0x03u64));
@@ -1318,22 +1279,17 @@ mod tests {
         })
         .unwrap();
         assert_eq!(interpreter.stack.data()[0], U256::from(3u64));
-        // Both an assigned native scheme and an executor-local extension are
-        // opaque. Official EIP-8141 envelope validation rejects the reserved
-        // 0x03 scheme before execution; the host boundary still fails closed if
-        // a local executor uses it.
-        for index in [0u64, 2] {
-            let mut interpreter = Interpreter::default();
-            let _ = interpreter.stack.push(U256::from(0x03u64));
-            let _ = interpreter.stack.push(U256::from(index));
-            assert_eq!(
-                sigparam(Ictx {
-                    interpreter: &mut interpreter,
-                    host: &mut host
-                }),
-                Err(InstructionResult::InvalidFEOpcode)
-            );
-        }
+        // Entry 0 uses SECP256K1, so its raw length is opaque.
+        let mut interpreter = Interpreter::default();
+        let _ = interpreter.stack.push(U256::from(0x03u64));
+        let _ = interpreter.stack.push(U256::ZERO);
+        assert_eq!(
+            sigparam(Ictx {
+                interpreter: &mut interpreter,
+                host: &mut host
+            }),
+            Err(InstructionResult::InvalidFEOpcode)
+        );
     }
 
     #[test]
@@ -1363,11 +1319,8 @@ mod tests {
 
     #[test]
     fn sigdatacopy_rejects_invalid_signature_entries() {
-        let mut extension = ctx();
-        extension.signatures[0].scheme = 0x03;
         for (case, frame, sig_index) in [
             ("non-ARBITRARY", ctx(), U256::ZERO),
-            ("executor-local non-ARBITRARY", extension, U256::ZERO),
             (
                 "out-of-bounds index",
                 ctx_with_arbitrary_signature(),
