@@ -565,7 +565,9 @@ mod tests {
             ),
             (
                 "exact ef0101",
-                Some(Bytecode::new_eip7851(DELEGATE_ADDRESS)),
+                Some(Bytecode::new_legacy(Bytes::from(
+                    [&[0xef, 0x01, 0x01][..], DELEGATE_ADDRESS.as_slice()].concat(),
+                ))),
                 false,
             ),
             (

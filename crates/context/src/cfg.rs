@@ -148,18 +148,6 @@ pub struct CfgEnv<SPEC = SpecId> {
     ///
     /// By default, it is set to `false`.
     pub enable_amsterdam_eip2780: bool,
-    /// Enables the experimental EIP-7819 `SETDELEGATE` instruction.
-    ///
-    /// EIP-7819 is not assigned to a hard fork yet. This flag is therefore
-    /// independent of [`CfgEnv::spec`] and defaults to `false`.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub enable_eip7819: bool,
-    /// Enables experimental EIP-7851 code-controlled EOA delegation.
-    ///
-    /// The feature additionally requires Prague or later and defaults to
-    /// `false` because EIP-7851 is not assigned to a hard fork.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub enable_eip7851: bool,
     /// Enables experimental EIP-8151 account-code-restricted `ecRecover`.
     ///
     /// The feature additionally requires Prague or later and defaults to
@@ -300,8 +288,6 @@ impl<SPEC> CfgEnv<SPEC> {
             disable_fee_charge: self.disable_fee_charge,
             enable_amsterdam_eip8037: self.enable_amsterdam_eip8037,
             enable_amsterdam_eip2780: self.enable_amsterdam_eip2780,
-            enable_eip7819: self.enable_eip7819,
-            enable_eip7851: self.enable_eip7851,
             enable_eip8151: self.enable_eip8151,
             amsterdam_eip7708_disabled: self.amsterdam_eip7708_disabled,
             amsterdam_eip8246_delayed_clear_disabled: self.amsterdam_eip8246_delayed_clear_disabled,
@@ -358,18 +344,6 @@ impl<SPEC> CfgEnv<SPEC> {
         self
     }
 
-    /// Sets the experimental EIP-7819 `SETDELEGATE` flag.
-    pub const fn with_enable_eip7819(mut self, enable: bool) -> Self {
-        self.enable_eip7819 = enable;
-        self
-    }
-
-    /// Sets the experimental EIP-7851 flag.
-    pub const fn with_enable_eip7851(mut self, enable: bool) -> Self {
-        self.enable_eip7851 = enable;
-        self
-    }
-
     /// Sets the experimental EIP-8151 flag.
     pub const fn with_enable_eip8151(mut self, enable: bool) -> Self {
         self.enable_eip8151 = enable;
@@ -412,8 +386,6 @@ impl<SPEC: Into<SpecId> + Clone> CfgEnv<SPEC> {
             disable_fee_charge: false,
             enable_amsterdam_eip8037: is_amsterdam,
             enable_amsterdam_eip2780: is_amsterdam,
-            enable_eip7819: false,
-            enable_eip7851: false,
             enable_eip8151: false,
             amsterdam_eip7708_disabled: false,
             amsterdam_eip8246_delayed_clear_disabled: false,
@@ -642,14 +614,6 @@ impl<SPEC: Into<SpecId> + Clone> Cfg for CfgEnv<SPEC> {
         self.enable_amsterdam_eip2780
     }
 
-    fn is_eip7819_enabled(&self) -> bool {
-        self.enable_eip7819
-    }
-
-    fn is_eip7851_enabled(&self) -> bool {
-        self.enable_eip7851
-    }
-
     fn is_eip8151_enabled(&self) -> bool {
         self.enable_eip8151
     }
@@ -672,28 +636,6 @@ mod test {
     fn blob_max_and_target_count() {
         let cfg: CfgEnv = Default::default();
         assert_eq!(cfg.max_blobs_per_tx(), None);
-    }
-
-    #[test]
-    fn eip7819_requires_explicit_opt_in_and_survives_spec_changes() {
-        let cfg = CfgEnv::new_with_spec(SpecId::PRAGUE);
-        assert!(!cfg.is_eip7819_enabled());
-
-        let cfg = cfg
-            .with_enable_eip7819(true)
-            .with_spec_and_mainnet_gas_params(SpecId::OSAKA);
-        assert!(cfg.is_eip7819_enabled());
-    }
-
-    #[test]
-    fn eip7851_requires_explicit_opt_in_and_survives_spec_changes() {
-        let cfg = CfgEnv::new_with_spec(SpecId::PRAGUE);
-        assert!(!cfg.is_eip7851_enabled());
-
-        let cfg = cfg
-            .with_enable_eip7851(true)
-            .with_spec_and_mainnet_gas_params(SpecId::OSAKA);
-        assert!(cfg.is_eip7851_enabled());
     }
 
     #[test]

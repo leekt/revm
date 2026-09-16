@@ -320,8 +320,6 @@ const fn instruction_table_impl<WIRE: InterpreterTypes, H: Host>() -> Instructio
     table[RETURN as usize] = Instruction::new(control::ret);
     table[DELEGATECALL as usize] = Instruction::new(contract::call::<DELEGATECALL, _, _>);
     table[CREATE2 as usize] = Instruction::new(contract::create::<true, _, _>);
-    table[SETDELEGATE as usize] = Instruction::new(host::setdelegate);
-    table[SETSELFDELEGATE as usize] = Instruction::new(host::setselfdelegate);
 
     table[STATICCALL as usize] = Instruction::new(contract::call::<STATICCALL, _, _>);
     table[REVERT as usize] = Instruction::new(control::revert);
@@ -504,8 +502,6 @@ const fn gas_table_impl() -> GasTable {
     table[RETURN as usize] = 0;
     table[DELEGATECALL as usize] = 40;
     table[CREATE2 as usize] = 0;
-    table[SETDELEGATE as usize] = primitives::eip7819::EMPTY_ACCOUNT_COST as u16;
-    table[SETSELFDELEGATE as usize] = primitives::eip7851::SETSELFDELEGATE_GAS as u16;
 
     table[STATICCALL as usize] = 40;
     table[REVERT as usize] = 0;

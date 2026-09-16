@@ -298,9 +298,35 @@ pub fn txparam<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
         0x0A => U256::from(frame.frame_index),
         0x0B => U256::from(frame.signatures.len() as u64),
         0x0C => U256::from(frame.state_gas_left),
+        // Current EIP-8250 selectors; 0x0C remains EIP-8141 state gas.
+        0x0D => U256::from(frame.legacy_nonce),
+        0x0E => U256::from(nonce_keys_len(&frame.nonce_keys)),
+        0x0F => nonce_keys_hash(&frame.nonce_keys),
+        0x10 => frame.nonce_keys.first().copied().unwrap_or(U256::ZERO),
         _ => return Err(InstructionResult::InvalidFEOpcode),
     };
     Ok(())
+}
+
+/// Number of selected nonce keys; an empty context list is the baseline `[0]`.
+fn nonce_keys_len(nonce_keys: &[U256]) -> u64 {
+    nonce_keys.len().max(1) as u64
+}
+
+/// EIP-8250 `nonce_keys_hash`: `keccak256(be32(len) || be32(k) for k in keys)`.
+pub fn nonce_keys_hash(nonce_keys: &[U256]) -> U256 {
+    let baseline = [U256::ZERO];
+    let keys: &[U256] = if nonce_keys.is_empty() {
+        &baseline
+    } else {
+        nonce_keys
+    };
+    let mut preimage = Vec::with_capacity(32 * (keys.len() + 1));
+    preimage.extend_from_slice(&U256::from(keys.len() as u64).to_be_bytes::<32>());
+    for key in keys {
+        preimage.extend_from_slice(&key.to_be_bytes::<32>());
+    }
+    U256::from_be_bytes(primitives::keccak256(preimage).0)
 }
 
 /// Implements the FRAMEDATALOAD instruction (0xb1).
@@ -1093,6 +1119,10 @@ mod tests {
             (0x0A, U256::from(1u64)),      // current frame index
             (0x0B, U256::from(1u64)),      // signature count
             (0x0C, U256::from(40_000u64)), // state_gas_left
+            (0x0D, U256::ZERO),            // pre-state legacy nonce
+            (0x0E, U256::from(1u64)),      // baseline key set [0]
+            (0x0F, nonce_keys_hash(&[])),  // nonce keys hash
+            (0x10, U256::ZERO),            // nonce_keys[0]
         ] {
             let mut interpreter = Interpreter::default();
             let _ = interpreter.stack.push(U256::from(param));
@@ -1103,8 +1133,8 @@ mod tests {
             .unwrap();
             assert_eq!(interpreter.stack.data()[0], want, "TXPARAM({param:#x})");
         }
-        // Every selector outside the normative table is undefined.
-        for param in 0x0Du64..=0xFF {
+        // Every selector outside the EIP-8141/8250 tables is undefined.
+        for param in 0x11u64..=0xFF {
             let mut interpreter = Interpreter::default();
             let _ = interpreter.stack.push(U256::from(param));
             assert_eq!(
@@ -1115,6 +1145,40 @@ mod tests {
                 Err(InstructionResult::InvalidFEOpcode),
                 "TXPARAM({param:#x})"
             );
+        }
+    }
+
+    /// EIP-8250 selectors read the selected key set, not the baseline alias.
+    #[test]
+    fn txparam_reads_keyed_nonce_selectors() {
+        let keys = vec![U256::from(5u64), U256::from(1u64) << 200];
+        let context = FrameTxContext {
+            nonce_keys: keys.clone(),
+            nonce: 0,
+            legacy_nonce: 42,
+            ..ctx()
+        };
+        let mut host = DummyHost::new(SpecId::default()).with_frame_tx(context, 0x3);
+        let mut preimage = Vec::new();
+        preimage.extend_from_slice(&U256::from(2u64).to_be_bytes::<32>());
+        preimage.extend_from_slice(&keys[0].to_be_bytes::<32>());
+        preimage.extend_from_slice(&keys[1].to_be_bytes::<32>());
+        let want_hash = U256::from_be_bytes(primitives::keccak256(preimage).0);
+        for (param, want) in [
+            (0x01u64, U256::ZERO),
+            (0x0D, U256::from(42u64)),
+            (0x0E, U256::from(2u64)),
+            (0x0F, want_hash),
+            (0x10, U256::from(5u64)),
+        ] {
+            let mut interpreter = Interpreter::default();
+            let _ = interpreter.stack.push(U256::from(param));
+            txparam(Ictx {
+                interpreter: &mut interpreter,
+                host: &mut host,
+            })
+            .unwrap();
+            assert_eq!(interpreter.stack.data()[0], want, "TXPARAM({param:#x})");
         }
     }
 

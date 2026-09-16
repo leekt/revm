@@ -48,7 +48,7 @@ pub fn create_init_frame<CTX: ContextTr>(
 ) -> Result<Option<FrameInput>, <<CTX::Journal as JournalTr>::Database as Database>::Error> {
     let is_eip2780 = ctx.cfg().is_amsterdam_eip2780_enabled();
     let spec: SpecId = ctx.cfg().spec().into();
-    let is_eip7851_enabled = ctx.cfg().is_eip7851_enabled() && spec.is_enabled_in(SpecId::PRAGUE);
+
     let params = ctx.cfg().gas_params();
     let new_account_state_gas = params.new_account_state_gas();
     let create_state_gas = params.create_state_gas();
@@ -88,13 +88,10 @@ pub fn create_init_frame<CTX: ContextTr>(
             let account = &journal.load_account_with_code(target_address)?.info;
             let recipient_is_empty = account.is_empty();
             let delegated_address = if spec.is_enabled_in(SpecId::PRAGUE) {
-                account.code.as_ref().and_then(|code| {
-                    if is_eip7851_enabled {
-                        code.delegated_address()
-                    } else {
-                        code.eip7702_address()
-                    }
-                })
+                account
+                    .code
+                    .as_ref()
+                    .and_then(|code| code.eip7702_address())
             } else {
                 None
             };

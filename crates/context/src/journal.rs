@@ -253,6 +253,51 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     }
 
     #[inline]
+    fn frame_transaction_storage(
+        &mut self,
+        address: Address,
+        slot: StorageKey,
+    ) -> Result<Option<StorageValue>, <Self::Database as Database>::Error> {
+        if let Some(account) = self.inner.state.get(&address) {
+            if let Some(value) = account.storage.get(&slot) {
+                return Ok(Some(value.present_value()));
+            }
+            // A journaled account that never touched this slot reads through to
+            // the database; a freshly created account has no persisted storage.
+            if account.is_created() {
+                return Ok(Some(StorageValue::ZERO));
+            }
+        }
+        Ok(Some(self.database.storage(address, slot)?))
+    }
+
+    fn set_frame_transaction_storage(
+        &mut self,
+        address: Address,
+        slot: StorageKey,
+        value: StorageValue,
+    ) -> Result<bool, <Self::Database as Database>::Error> {
+        let account_cold = self.load_account(address)?.is_cold;
+        let slot_cold = self.sstore(address, slot, value)?.is_cold;
+        let account = self
+            .inner
+            .state
+            .get_mut(&address)
+            .expect("account was loaded");
+        if account_cold {
+            account.mark_cold();
+        }
+        if slot_cold {
+            account
+                .storage
+                .get_mut(&slot)
+                .expect("slot was stored")
+                .mark_cold();
+        }
+        Ok(true)
+    }
+
+    #[inline]
     fn frame_transaction_checkpoint(&mut self) -> JournalCheckpoint {
         self.inner.frame_transaction_checkpoint()
     }
@@ -380,11 +425,6 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     ) -> Result<StateLoad<AccountLoad>, DB::Error> {
         self.inner
             .load_account_delegated(&mut self.database, address)
-    }
-
-    #[inline]
-    fn set_eip7851_enabled(&mut self, enabled: bool) {
-        self.inner.set_eip7851_enabled(enabled);
     }
 
     #[inline]

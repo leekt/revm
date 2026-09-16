@@ -26,13 +26,10 @@ pub fn load_accounts<
 
     let gen_spec = context.cfg().spec();
     let spec = gen_spec.clone().into();
-    let is_eip7851_enabled =
-        context.cfg().is_eip7851_enabled() && spec.is_enabled_in(SpecId::PRAGUE);
+
     // sets eth spec id in journal
     context.journal_mut().set_spec_id(spec);
-    context
-        .journal_mut()
-        .set_eip7851_enabled(is_eip7851_enabled);
+
     let precompiles_changed = precompiles.set_spec(gen_spec);
     let empty_warmed_precompiles = context.journal_mut().precompile_addresses().is_empty();
 
@@ -74,26 +71,18 @@ pub fn load_accounts<
     Ok(())
 }
 
-/// Validates caller account nonce and code according to EIP-3607 and EIP-7851.
-///
-/// EIP-7851 rejection applies only when [`Transaction`] classifies the sender
-/// as authenticated by the protocol ECDSA transaction envelope.
+/// Validates caller account nonce and code according to EIP-3607.
 #[inline]
 pub fn validate_account_nonce_and_code_with_components(
     caller_info: &AccountInfo,
     tx: impl Transaction,
     cfg: impl Cfg,
 ) -> Result<(), InvalidTransaction> {
-    let is_eip7851_enabled =
-        cfg.is_eip7851_enabled() && cfg.spec().into().is_enabled_in(SpecId::PRAGUE);
-    let is_eip7851_sender_ecdsa_authenticated = tx.is_eip7851_sender_ecdsa_authenticated();
-    validate_account_nonce_and_code_inner(
+    validate_account_nonce_and_code(
         caller_info,
         tx.nonce(),
         cfg.is_eip3607_disabled(),
         cfg.is_nonce_check_disabled(),
-        is_eip7851_enabled,
-        is_eip7851_sender_ecdsa_authenticated,
     )
 }
 
@@ -105,38 +94,14 @@ pub fn validate_account_nonce_and_code(
     is_eip3607_disabled: bool,
     is_nonce_check_disabled: bool,
 ) -> Result<(), InvalidTransaction> {
-    validate_account_nonce_and_code_inner(
-        caller_info,
-        tx_nonce,
-        is_eip3607_disabled,
-        is_nonce_check_disabled,
-        false,
-        true,
-    )
-}
-
-#[inline]
-fn validate_account_nonce_and_code_inner(
-    caller_info: &AccountInfo,
-    tx_nonce: u64,
-    is_eip3607_disabled: bool,
-    is_nonce_check_disabled: bool,
-    is_eip7851_enabled: bool,
-    is_eip7851_sender_ecdsa_authenticated: bool,
-) -> Result<(), InvalidTransaction> {
-    let default_bytecode = Bytecode::default();
-    let bytecode = caller_info.code.as_ref().unwrap_or(&default_bytecode);
-
-    // EIP-7851 rejects ECDSA-authenticated senders independently of the
-    // optional EIP-3607 simulation override.
-    if is_eip7851_enabled && is_eip7851_sender_ecdsa_authenticated && bytecode.is_eip7851() {
-        return Err(InvalidTransaction::RejectCallerWithCode);
-    }
-
     // EIP-3607: Reject transactions from senders with deployed code
     // This EIP is introduced after london but there was no collision in past
     // so we can leave it enabled always
     if !is_eip3607_disabled {
+        let bytecode = match caller_info.code.as_ref() {
+            Some(code) => code,
+            None => &Bytecode::default(),
+        };
         // Allow EOAs whose code is a valid delegation designation,
         // i.e. 0xef0100 || address, to continue to originate transactions.
         if !bytecode.is_empty() && !bytecode.is_eip7702() {
@@ -441,8 +406,7 @@ pub fn apply_auth_list_eip2780<
         let mut authority_acc = journal.load_account_with_code_mut(authority)?;
         let authority_acc_info = &authority_acc.account().info;
 
-        // 5. Verify the code is empty or strictly EIP-7702. EIP-7851's
-        // ECDSA-disabled designation is intentionally excluded.
+        // 5. Verify the code is empty or strictly EIP-7702.
         if let Some(bytecode) = &authority_acc_info.code {
             // if it is not empty and it is not eip7702
             if !bytecode.is_empty() && !bytecode.is_eip7702() {
@@ -564,8 +528,7 @@ pub fn apply_auth_list<
         let mut authority_acc = journal.load_account_with_code_mut(authority)?;
         let authority_acc_info = &authority_acc.account().info;
 
-        // 5. Verify the code is empty or strictly EIP-7702. EIP-7851's
-        // ECDSA-disabled designation is intentionally excluded.
+        // 5. Verify the code is empty or strictly EIP-7702.
         if let Some(bytecode) = &authority_acc_info.code {
             // if it is not empty and it is not eip7702
             if !bytecode.is_empty() && !bytecode.is_eip7702() {
@@ -599,10 +562,8 @@ pub fn apply_auth_list<
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_account_nonce_and_code, validate_account_nonce_and_code_inner};
-    use bytecode::Bytecode;
+    use super::validate_account_nonce_and_code;
     use context_interface::result::InvalidTransaction;
-    use primitives::Address;
     use state::AccountInfo;
 
     #[test]
@@ -626,22 +587,5 @@ mod tests {
         };
 
         assert!(validate_account_nonce_and_code(&caller_info, 7, false, false).is_ok());
-    }
-
-    #[test]
-    fn eip7851_rejects_only_protocol_ecdsa_authenticated_senders() {
-        let caller_info = AccountInfo::default()
-            .with_nonce(7)
-            .with_code(Bytecode::new_eip7851(Address::repeat_byte(0x11)));
-
-        assert_eq!(
-            validate_account_nonce_and_code_inner(&caller_info, 7, true, false, true, true),
-            Err(InvalidTransaction::RejectCallerWithCode)
-        );
-        assert!(
-            validate_account_nonce_and_code_inner(&caller_info, 7, true, false, true, false)
-                .is_ok(),
-            "non-ECDSA transactions must remain valid under the EIP-3607 override"
-        );
     }
 }

@@ -40,9 +40,6 @@ pub struct JournalCfg {
     /// [EIP-161]: https://eips.ethereum.org/EIPS/eip-161
     /// [EIP-6780]: https://eips.ethereum.org/EIPS/eip-6780
     pub spec: SpecId,
-    /// Whether EIP-7851 delegation resolution is enabled for this spec.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub eip7851_enabled: bool,
     /// Whether EIP-7708 (ETH transfers emit logs) is disabled.
     pub eip7708_disabled: bool,
     /// Whether the EIP-8246 delayed clearing of self-destructed accounts is disabled.
@@ -546,12 +543,6 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         self.cfg.spec = spec;
     }
 
-    /// Sets EIP-7851 delegation resolution.
-    #[inline]
-    pub const fn set_eip7851_enabled(&mut self, enabled: bool) {
-        self.cfg.eip7851_enabled = enabled;
-    }
-
     /// Sets EIP-7708 and EIP-8246 configuration flags.
     #[inline]
     pub const fn set_eip7708_config(
@@ -1028,7 +1019,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     ) -> Result<StateLoad<AccountLoad>, DB::Error> {
         let spec = self.cfg.spec;
         let is_eip7702_enabled = spec.is_enabled_in(SpecId::PRAGUE);
-        let is_eip7851_enabled = self.cfg.eip7851_enabled;
+
         let account = self
             .load_account_optional(db, address, is_eip7702_enabled, false)
             .map_err(JournalLoadError::unwrap_db_error)?;
@@ -1042,12 +1033,9 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             account.is_cold,
         );
 
-        // EIP-7702 remains the strict default. EIP-7851 broadens execution
-        // resolution only under its explicit Prague-or-later opt-in.
+        // Resolve only the standard EIP-7702 designation when its fork is active.
         let delegated_address = account.info.code.as_ref().and_then(|code| {
-            if is_eip7702_enabled && is_eip7851_enabled {
-                code.delegated_address()
-            } else if is_eip7702_enabled {
+            if is_eip7702_enabled {
                 code.eip7702_address()
             } else {
                 None

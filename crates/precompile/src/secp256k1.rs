@@ -103,8 +103,8 @@ mod tests {
         assert!(is_ecrecover_code_eligible(&eip7702_zero_delegate));
         assert!(is_ecrecover_code_eligible(&eip7702_nonzero_delegate));
 
-        let mut eip7851 = eip7702_nonzero_delegate.clone();
-        eip7851[2] = 0x01;
+        let mut unsupported_version = eip7702_nonzero_delegate.clone();
+        unsupported_version[2] = 0x01;
         let mut trailing = eip7702_nonzero_delegate.clone();
         trailing.push(0);
         let mut wrong_version = vec![0; 23];
@@ -115,7 +115,7 @@ mod tests {
             vec![0xef, 0x01, 0x00],
             eip7702_nonzero_delegate[..22].to_vec(),
             trailing,
-            eip7851,
+            unsupported_version,
             wrong_version,
         ] {
             assert!(!is_ecrecover_code_eligible(&code), "accepted {code:02x?}");

@@ -214,6 +214,32 @@ pub trait JournalTr {
         Ok(None)
     }
 
+    /// Reads a storage slot for frame-transaction protocol bookkeeping (EIP-8250
+    /// keyed nonces, EIP-8272 recent-root references) without warming the
+    /// account or slot and without journaling an access.
+    ///
+    /// Lifecycle-capable journals must override this with a non-warming lookup
+    /// that observes journaled writes. The default fails closed, like
+    /// [`Self::frame_transaction_account_info`].
+    fn frame_transaction_storage(
+        &mut self,
+        _address: Address,
+        _slot: StorageKey,
+    ) -> Result<Option<StorageValue>, <Self::Database as Database>::Error> {
+        Ok(None)
+    }
+
+    /// Writes protocol-owned keyed-nonce storage without warming the account or slot.
+    /// Returns false for journals that do not support this operation.
+    fn set_frame_transaction_storage(
+        &mut self,
+        _address: Address,
+        _slot: StorageKey,
+        _value: StorageValue,
+    ) -> Result<bool, <Self::Database as Database>::Error> {
+        Ok(false)
+    }
+
     /// Opens a transaction-lifecycle checkpoint that should not count as EVM call depth.
     /// Lifecycle-capable custom journals should override all three checkpoint methods.
     fn frame_transaction_checkpoint(&mut self) -> JournalCheckpoint {
@@ -232,9 +258,6 @@ pub trait JournalTr {
 
     /// Sets the spec id.
     fn set_spec_id(&mut self, spec_id: SpecId);
-
-    /// Configures EIP-7851 delegation resolution for journal-level loads.
-    fn set_eip7851_enabled(&mut self, _enabled: bool) {}
 
     /// Sets EIP-7708 and EIP-8246 configuration flags.
     ///

@@ -3,17 +3,15 @@ use crate::{block::BlockEnv, cfg::CfgEnv, journal::Journal, tx::TxEnv, LocalCont
 use context_interface::{
     cfg::GasParams,
     context::{ContextError, ContextSetters, SStoreResult, SelfDestructResult, StateLoad},
-    host::{LoadError, SetDelegateError},
-    journaled_state::{account::JournaledAccountTr, AccountInfoLoad},
+    host::LoadError,
+    journaled_state::AccountInfoLoad,
     Block, Cfg, ContextTr, Host, JournalTr, LocalContextTr, Transaction, TransactionType,
 };
 use database_interface::{Database, DatabaseRef, EmptyDB, WrapDatabaseRef};
 use derive_where::derive_where;
 use primitives::{
-    eip7819::DELEGATION_PREFIX, hardfork::SpecId, hints_util::cold_path, Address, Log, StorageKey,
-    StorageValue, B256, U256,
+    hardfork::SpecId, hints_util::cold_path, Address, Log, StorageKey, StorageValue, B256, U256,
 };
-use state::Bytecode;
 
 /// EVM context contains data that EVM needs for execution.
 #[derive_where(Clone, Debug; BLOCK, CFG, CHAIN, TX, DB, JOURNAL, <DB as Database>::Error, LOCAL)]
@@ -46,7 +44,6 @@ pub struct Context<
 fn sync_cfg_to_journal<CFG: Cfg, JOURNAL: JournalTr>(cfg: &CFG, journal: &mut JOURNAL) {
     let spec = cfg.spec().into();
     journal.set_spec_id(spec);
-    journal.set_eip7851_enabled(cfg.is_eip7851_enabled() && spec.is_enabled_in(SpecId::PRAGUE));
     journal.set_eip7708_config(
         cfg.is_eip7708_disabled(),
         cfg.is_eip8246_delayed_clear_disabled(),
@@ -471,14 +468,6 @@ impl<
         self.cfg().is_amsterdam_eip8037_enabled()
     }
 
-    fn is_eip7819_enabled(&self) -> bool {
-        self.cfg().is_eip7819_enabled()
-    }
-
-    fn is_eip7851_enabled(&self) -> bool {
-        self.cfg().is_eip7851_enabled() && self.cfg().spec().into().is_enabled_in(SpecId::PRAGUE)
-    }
-
     fn block_number(&self) -> U256 {
         self.block().number()
     }
@@ -555,68 +544,6 @@ impl<
     /// Emits a log owned by `address` with given `LogData`.
     fn log(&mut self, log: Log) {
         self.journal_mut().log(log);
-    }
-
-    fn set_delegate(
-        &mut self,
-        location: Address,
-        target: Address,
-    ) -> Option<Result<bool, SetDelegateError>> {
-        let mut account = match self
-            .journaled_state
-            .load_account_mut_optional_code(location, true)
-        {
-            Ok(account) => account,
-            Err(err) => {
-                cold_path();
-                self.error = Err(err.into());
-                return None;
-            }
-        };
-        // EIP-7523 forbids empty trie accounts on networks where SETDELEGATE can run. Checking
-        // account contents also handles databases that materialize missing addresses as defaults.
-        let existed = !account.account().is_empty();
-        let collision = account.code().is_some_and(|code| {
-            let raw = code.original_byte_slice();
-            !raw.is_empty() && !raw.starts_with(&DELEGATION_PREFIX)
-        });
-        if collision {
-            return Some(Err(SetDelegateError::AddressCollision));
-        }
-
-        let code = if target.is_zero() {
-            Bytecode::default()
-        } else {
-            Bytecode::new_eip7702(target)
-        };
-        account.set_code_and_hash_slow(code);
-        if account.nonce() == 0 {
-            account.set_nonce(1);
-        }
-        Some(Ok(existed))
-    }
-
-    fn set_self_delegate(&mut self, authority: Address, target: Address) -> Option<bool> {
-        if target.is_zero() {
-            return Some(false);
-        }
-        let mut account = match self
-            .journaled_state
-            .load_account_mut_optional_code(authority, true)
-        {
-            Ok(account) => account,
-            Err(err) => {
-                cold_path();
-                self.error = Err(err.into());
-                return None;
-            }
-        };
-        if !account.code().is_some_and(Bytecode::is_delegation) {
-            return Some(false);
-        }
-
-        account.set_code_and_hash_slow(Bytecode::new_eip7851(target));
-        Some(true)
     }
 
     /// Marks `address` to be deleted, with funds transferred to `target`.
@@ -706,10 +633,10 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use context_interface::host::{LoadError, SetDelegateError};
+    use context_interface::host::LoadError;
     use database::{CacheDB, EmptyDB};
-    use primitives::{address, eip7819, hardfork::SpecId, Bytes, KECCAK_EMPTY};
-    use state::{AccountInfo, Bytecode};
+    use primitives::{address, hardfork::SpecId};
+    use state::AccountInfo;
 
     #[test]
     fn host_sload_loads_an_untouched_address_and_honors_skip_cold() {
@@ -759,336 +686,61 @@ mod tests {
     }
 
     #[test]
-    fn setdelegate_journals_updates_clearing_warming_and_revert() {
-        let execution_address = address!("1111111111111111111111111111111111111111");
-        let target = address!("2222222222222222222222222222222222222222");
-        let replacement = address!("3333333333333333333333333333333333333333");
-        let location = eip7819::setdelegate_address(execution_address, U256::ZERO);
-        let mut context: Context<BlockEnv, TxEnv, CfgEnv, CacheDB<EmptyDB>> =
-            Context::new(CacheDB::default(), SpecId::PRAGUE);
-        context.cfg.enable_eip7819 = true;
-        let checkpoint = context.journal_mut().checkpoint();
-
-        assert_eq!(
-            Host::set_delegate(&mut context, location, target),
-            Some(Ok(false))
-        );
-        {
-            let account = context
-                .journal_mut()
-                .load_account_with_code(location)
-                .unwrap();
-            assert_eq!(account.info.nonce, 1);
-            assert_eq!(
-                account.info.code.as_ref().unwrap().eip7702_address(),
-                Some(target)
-            );
-        }
-        assert!(
-            Host::load_account_info_skip_cold_load(&mut context, location, false, true).is_ok(),
-            "SETDELEGATE did not warm its location"
-        );
-        assert_eq!(
-            Host::load_account_info_skip_cold_load(&mut context, target, false, true),
-            Err(LoadError::ColdLoadSkipped),
-            "SETDELEGATE warmed its target"
-        );
-
-        assert_eq!(
-            Host::set_delegate(&mut context, location, replacement),
-            Some(Ok(true))
-        );
-        {
-            let account = context
-                .journal_mut()
-                .load_account_with_code(location)
-                .unwrap();
-            assert_eq!(account.info.nonce, 1, "replacement incremented the nonce");
-            assert_eq!(
-                account.info.code.as_ref().unwrap().eip7702_address(),
-                Some(replacement)
-            );
-        }
-        assert_eq!(
-            Host::set_delegate(&mut context, location, Address::ZERO),
-            Some(Ok(true))
-        );
-        {
-            let account = context
-                .journal_mut()
-                .load_account_with_code(location)
-                .unwrap();
-            assert_eq!(account.info.nonce, 1);
-            assert_eq!(account.info.code_hash, KECCAK_EMPTY);
-            assert!(account.info.code.as_ref().unwrap().is_empty());
-        }
-
-        context.journal_mut().checkpoint_revert(checkpoint);
-        let account = context
-            .journal_mut()
-            .load_account_with_code(location)
-            .unwrap();
-        assert_eq!(account.info.nonce, 0);
-        assert!(account.info.code.as_ref().unwrap().is_empty());
-        assert!(account.is_loaded_as_not_existing_not_touched());
-    }
-
-    #[test]
-    fn setdelegate_does_not_refund_a_materialized_empty_account() {
-        let location = address!("1000000000000000000000000000000000000000");
-        let target = address!("2000000000000000000000000000000000000000");
-        let replacement = address!("3000000000000000000000000000000000000000");
-        let mut db = CacheDB::<EmptyDB>::default();
-        db.insert_account_info(location, AccountInfo::default());
-        let mut context: Context<BlockEnv, TxEnv, CfgEnv, CacheDB<EmptyDB>> =
-            Context::new(db, SpecId::PRAGUE);
-
-        assert_eq!(
-            Host::set_delegate(&mut context, location, target),
-            Some(Ok(false))
-        );
-        assert_eq!(
-            Host::set_delegate(&mut context, location, replacement),
-            Some(Ok(true))
-        );
-    }
-
-    #[test]
-    fn setdelegate_preserves_existing_state_and_rejects_only_ordinary_code() {
-        let existing = address!("1000000000000000000000000000000000000000");
-        let collision = address!("2000000000000000000000000000000000000000");
-        let replaceable = address!("3000000000000000000000000000000000000000");
-        let target = address!("4444444444444444444444444444444444444444");
+    fn protocol_storage_preserves_access_warmth_and_rolls_back() {
+        let address = address!("0000000000000000000000000000000000008250");
         let key = U256::from(7u64);
-        let value = U256::from(9u64);
-        let ordinary_code = Bytecode::new_legacy(Bytes::from_static(&[0x00]));
-        let prefixed_code = Bytecode::new_legacy(Bytes::from_static(&[0xef, 0x01, 0x00, 0xff]));
-        let mut db = CacheDB::<EmptyDB>::default();
-        db.insert_account_info(
-            existing,
-            AccountInfo {
-                balance: U256::from(5u64),
-                ..Default::default()
-            },
-        );
-        db.insert_account_storage(existing, key, value).unwrap();
-        db.insert_account_info(
-            collision,
-            AccountInfo {
-                code_hash: ordinary_code.hash_slow(),
-                code: Some(ordinary_code.clone()),
-                ..Default::default()
-            },
-        );
-        db.insert_account_info(
-            replaceable,
-            AccountInfo {
-                nonce: 7,
-                code_hash: prefixed_code.hash_slow(),
-                code: Some(prefixed_code),
-                ..Default::default()
-            },
-        );
-        let mut context: Context<BlockEnv, TxEnv, CfgEnv, CacheDB<EmptyDB>> =
-            Context::new(db, SpecId::PRAGUE);
-
-        assert_eq!(
-            Host::set_delegate(&mut context, existing, target),
-            Some(Ok(true))
-        );
-        {
-            let account = context
-                .journal_mut()
-                .load_account_with_code(existing)
-                .unwrap();
-            assert_eq!(account.info.balance, U256::from(5u64));
-            assert_eq!(account.info.nonce, 1);
-            assert_eq!(
-                account.info.code.as_ref().unwrap().eip7702_address(),
-                Some(target)
-            );
-        }
-        assert_eq!(
-            context.journal_mut().sload(existing, key).unwrap().data,
-            value
-        );
-
-        assert_eq!(
-            Host::set_delegate(&mut context, collision, target),
-            Some(Err(SetDelegateError::AddressCollision))
-        );
-        let account = context
-            .journal_mut()
-            .load_account_with_code(collision)
-            .unwrap();
-        assert_eq!(
-            account.info.code.as_ref().unwrap().original_byte_slice(),
-            &[0x00]
-        );
-
-        assert_eq!(
-            Host::set_delegate(&mut context, replaceable, target),
-            Some(Ok(true))
-        );
-        let account = context
-            .journal_mut()
-            .load_account_with_code(replaceable)
-            .unwrap();
-        assert_eq!(account.info.nonce, 7);
-        assert_eq!(
-            account.info.code.as_ref().unwrap().eip7702_address(),
-            Some(target)
-        );
-    }
-
-    #[test]
-    fn setselfdelegate_accepts_exact_enabled_and_disabled_designations_and_reverts() {
-        let authority = address!("1000000000000000000000000000000000000011");
-        let old_target = address!("2000000000000000000000000000000000000022");
-        let new_target = address!("3000000000000000000000000000000000000033");
-
-        for original in [
-            Bytecode::new_eip7702(old_target),
-            Bytecode::new_eip7851(old_target),
-        ] {
+        for initially_warm in [false, true] {
             let mut db = CacheDB::<EmptyDB>::default();
             db.insert_account_info(
-                authority,
-                AccountInfo {
-                    nonce: 7,
-                    code_hash: original.hash_slow(),
-                    code: Some(original.clone()),
-                    ..Default::default()
-                },
-            );
-            db.insert_account_info(
-                new_target,
+                address,
                 AccountInfo {
                     nonce: 1,
                     ..Default::default()
                 },
             );
+            db.insert_account_storage(address, key, U256::from(3u64))
+                .unwrap();
             let mut context: Context<BlockEnv, TxEnv, CfgEnv, CacheDB<EmptyDB>> =
-                Context::new(db, SpecId::PRAGUE);
-            let checkpoint = context.journal_mut().checkpoint();
-
-            assert_eq!(
-                Host::set_self_delegate(&mut context, authority, new_target),
-                Some(true)
-            );
-            {
-                let account = context
-                    .journal_mut()
-                    .load_account_with_code(authority)
-                    .unwrap();
-                assert_eq!(account.info.nonce, 7, "SETSELFDELEGATE bumped nonce");
-                assert_eq!(
-                    account.info.code.as_ref().unwrap().eip7851_address(),
-                    Some(new_target)
-                );
+                Context::new(db, SpecId::BERLIN);
+            let journal = &mut context.journaled_state;
+            if initially_warm {
+                journal.load_account(address).unwrap();
+                journal.sload(address, key).unwrap();
             }
+            let checkpoint = journal.frame_transaction_checkpoint();
             assert_eq!(
-                Host::load_account_info_skip_cold_load(&mut context, new_target, false, true),
-                Err(LoadError::ColdLoadSkipped),
-                "SETSELFDELEGATE loaded or warmed its new target"
+                journal.frame_transaction_storage(address, key).unwrap(),
+                Some(U256::from(3u64))
             );
-
-            context.journal_mut().checkpoint_revert(checkpoint);
-            let account = context
-                .journal_mut()
-                .load_account_with_code(authority)
-                .unwrap();
-            assert_eq!(account.info.nonce, 7);
-            assert_eq!(account.info.code.as_ref(), Some(&original));
-        }
-    }
-
-    #[test]
-    fn setselfdelegate_zero_and_invalid_raw_authority_do_not_mutate() {
-        let authority = address!("1000000000000000000000000000000000000011");
-        let target = address!("2000000000000000000000000000000000000022");
-        let valid = Bytecode::new_eip7702(target);
-        let mut db = CacheDB::<EmptyDB>::default();
-        db.insert_account_info(
-            authority,
-            AccountInfo {
-                nonce: 9,
-                code_hash: valid.hash_slow(),
-                code: Some(valid),
-                ..Default::default()
-            },
-        );
-        let mut context: Context<BlockEnv, TxEnv, CfgEnv, CacheDB<EmptyDB>> =
-            Context::new(db, SpecId::PRAGUE);
-        assert_eq!(
-            Host::set_self_delegate(&mut context, authority, Address::ZERO),
-            Some(false)
-        );
-        assert!(
-            context.journal().evm_state().get(&authority).is_none(),
-            "zero target loaded or mutated the authority"
-        );
-
-        let mut malformed = vec![0xef, 0x01, 0x00];
-        malformed.extend_from_slice(&[0x44; 21]);
-        for invalid in [
-            Bytecode::new_legacy(Bytes::from_static(&[0x00])),
-            Bytecode::new_legacy(malformed.into()),
-        ] {
-            let mut db = CacheDB::<EmptyDB>::default();
-            db.insert_account_info(
-                authority,
-                AccountInfo {
-                    nonce: 9,
-                    code_hash: invalid.hash_slow(),
-                    code: Some(invalid.clone()),
-                    ..Default::default()
-                },
-            );
-            let mut context: Context<BlockEnv, TxEnv, CfgEnv, CacheDB<EmptyDB>> =
-                Context::new(db, SpecId::PRAGUE);
-
+            assert!(journal
+                .set_frame_transaction_storage(address, key, U256::from(4u64))
+                .unwrap());
+            assert!(journal.inner.state[&address].is_touched());
             assert_eq!(
-                Host::set_self_delegate(&mut context, authority, target),
-                Some(false)
+                journal.frame_transaction_storage(address, key).unwrap(),
+                Some(U256::from(4u64))
             );
-            let account = context
-                .journal_mut()
-                .load_account_with_code(authority)
-                .unwrap();
-            assert_eq!(account.info.nonce, 9);
-            assert_eq!(account.info.code.as_ref(), Some(&invalid));
+            assert_eq!(
+                journal.load_account(address).unwrap().is_cold,
+                !initially_warm
+            );
+            let slot = journal.sstore(address, key, U256::from(5u64)).unwrap();
+            assert_eq!(slot.is_cold, !initially_warm);
+            assert_eq!(slot.original_value, U256::from(3u64));
+            assert_eq!(slot.present_value, U256::from(4u64));
+            journal.frame_transaction_checkpoint_revert(checkpoint);
+            assert_eq!(
+                journal.frame_transaction_storage(address, key).unwrap(),
+                Some(U256::from(3u64))
+            );
+            assert_eq!(
+                journal.load_account(address).unwrap().is_cold,
+                !initially_warm
+            );
+            assert_eq!(
+                journal.sload(address, key).unwrap().is_cold,
+                !initially_warm
+            );
         }
-    }
-
-    #[test]
-    fn setdelegate_treats_eip7851_as_an_address_collision() {
-        let location = address!("1000000000000000000000000000000000000011");
-        let old_target = address!("2000000000000000000000000000000000000022");
-        let new_target = address!("3000000000000000000000000000000000000033");
-        let disabled = Bytecode::new_eip7851(old_target);
-        let mut db = CacheDB::<EmptyDB>::default();
-        db.insert_account_info(
-            location,
-            AccountInfo {
-                nonce: 4,
-                code_hash: disabled.hash_slow(),
-                code: Some(disabled.clone()),
-                ..Default::default()
-            },
-        );
-        let mut context: Context<BlockEnv, TxEnv, CfgEnv, CacheDB<EmptyDB>> =
-            Context::new(db, SpecId::PRAGUE);
-
-        assert_eq!(
-            Host::set_delegate(&mut context, location, new_target),
-            Some(Err(SetDelegateError::AddressCollision))
-        );
-        let account = context
-            .journal_mut()
-            .load_account_with_code(location)
-            .unwrap();
-        assert_eq!(account.info.nonce, 4);
-        assert_eq!(account.info.code.as_ref(), Some(&disabled));
     }
 }

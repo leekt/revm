@@ -20,14 +20,6 @@ pub enum LoadError {
     DBError,
 }
 
-/// Exceptional error returned while applying EIP-7819 `SETDELEGATE`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum SetDelegateError {
-    /// The destination contains non-empty code without the EIP-7702 prefix.
-    AddressCollision,
-}
-
 /// EIP-8141 frame transaction context.
 ///
 /// Frame transactions decompose a transaction into frames that validate it,
@@ -45,8 +37,15 @@ pub enum SetDelegateError {
 pub struct FrameTxContext {
     /// The declared sender of the transaction.
     pub sender: Address,
-    /// Transaction's scalar wire nonce, `TXPARAM(0x01)`.
+    /// Transaction's replay-protection sequence, `TXPARAM(0x01)`: the scalar
+    /// wire nonce of a baseline EIP-8141 envelope, or `nonce_seq` of an
+    /// EIP-8250 envelope.
     pub nonce: u64,
+    /// Sender account nonce from the outer transaction pre-state (EIP-8250 0x0D).
+    pub legacy_nonce: u64,
+    /// EIP-8250 nonce keys in envelope order. An empty list means the baseline
+    /// key set `[0]` (the legacy account nonce).
+    pub nonce_keys: Vec<U256>,
     /// State gas remaining in the currently executing frame, `TXPARAM(0x0C)`.
     pub state_gas_left: u64,
     /// Canonical signature hash, `TXPARAM(0x08)`.
@@ -377,16 +376,6 @@ pub trait Host {
     /// Returns whether state gas (EIP-8037) is enabled.
     fn is_amsterdam_eip8037_enabled(&self) -> bool;
 
-    /// Returns whether the experimental EIP-7819 `SETDELEGATE` instruction is enabled.
-    fn is_eip7819_enabled(&self) -> bool {
-        false
-    }
-
-    /// Returns whether EIP-7851 is active for the host's current spec.
-    fn is_eip7851_enabled(&self) -> bool {
-        false
-    }
-
     /* EIP-8141 frame transaction */
 
     /// Frame transaction context, or `None` when this is not a frame transaction.
@@ -404,26 +393,6 @@ pub trait Host {
     /// approve payment or execution.
     fn frame_approve(&mut self, _scope: u64) -> bool {
         false
-    }
-
-    /// Applies EIP-7819 delegation code at `location`.
-    ///
-    /// Returns whether `location` existed before the write. `None` represents a
-    /// host/database failure; hosts that do not implement EIP-7819 default to `None`.
-    fn set_delegate(
-        &mut self,
-        _location: Address,
-        _target: Address,
-    ) -> Option<Result<bool, SetDelegateError>> {
-        None
-    }
-
-    /// Replaces `authority`'s valid delegation with an ECDSA-disabled one.
-    ///
-    /// Returns `Some(true)` on mutation, `Some(false)` for a zero target or an
-    /// invalid raw authority designation, and `None` on host/database failure.
-    fn set_self_delegate(&mut self, _authority: Address, _target: Address) -> Option<bool> {
-        None
     }
 
     /* Database */
@@ -508,7 +477,6 @@ pub trait Host {
     /// Load account delegated, calls `ContextTr::journal_mut().load_account_delegated(address)`
     #[inline]
     fn load_account_delegated(&mut self, address: Address) -> Option<StateLoad<AccountLoad>> {
-        let is_eip7851_enabled = self.is_eip7851_enabled();
         let account = self
             .load_account_info_skip_cold_load(address, true, false)
             .ok()?;
@@ -521,13 +489,10 @@ pub trait Host {
             account.is_cold,
         );
 
-        let delegated_address = account.code.as_ref().and_then(|code| {
-            if is_eip7851_enabled {
-                code.delegated_address()
-            } else {
-                code.eip7702_address()
-            }
-        });
+        let delegated_address = account
+            .code
+            .as_ref()
+            .and_then(|code| code.eip7702_address());
         if let Some(address) = delegated_address {
             let delegate_account = self
                 .load_account_info_skip_cold_load(address, true, false)
@@ -583,18 +548,6 @@ pub struct DummyHost {
     pub approvable_scopes: u64,
     /// Number of calls made to [`Host::frame_approve`].
     pub frame_approve_calls: usize,
-    /// Enables EIP-7819 for interpreter tests.
-    pub enable_eip7819: bool,
-    /// Enables EIP-7851 for interpreter tests.
-    pub enable_eip7851: bool,
-    /// Result returned by the EIP-7819 state mutation fixture.
-    pub set_delegate_result: Option<Result<bool, SetDelegateError>>,
-    /// Calls made to the EIP-7819 state mutation fixture.
-    pub set_delegate_calls: Vec<(Address, Address)>,
-    /// Result returned by the EIP-7851 state mutation fixture.
-    pub set_self_delegate_result: Option<bool>,
-    /// Calls made to the EIP-7851 state mutation fixture.
-    pub set_self_delegate_calls: Vec<(Address, Address)>,
     /// Account returned by fixture live-state reads.
     pub account_info: AccountInfo,
     /// Whether the next fixture account read is cold.
@@ -666,28 +619,6 @@ impl Host for DummyHost {
 
     fn is_amsterdam_eip8037_enabled(&self) -> bool {
         self.spec_id.is_enabled_in(SpecId::AMSTERDAM)
-    }
-
-    fn is_eip7819_enabled(&self) -> bool {
-        self.enable_eip7819
-    }
-
-    fn is_eip7851_enabled(&self) -> bool {
-        self.enable_eip7851 && self.spec_id.is_enabled_in(SpecId::PRAGUE)
-    }
-
-    fn set_delegate(
-        &mut self,
-        location: Address,
-        target: Address,
-    ) -> Option<Result<bool, SetDelegateError>> {
-        self.set_delegate_calls.push((location, target));
-        Some(self.set_delegate_result.unwrap_or(Ok(false)))
-    }
-
-    fn set_self_delegate(&mut self, authority: Address, target: Address) -> Option<bool> {
-        self.set_self_delegate_calls.push((authority, target));
-        self.set_self_delegate_result
     }
 
     fn difficulty(&self) -> U256 {

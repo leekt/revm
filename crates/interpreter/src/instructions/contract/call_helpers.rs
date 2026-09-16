@@ -154,7 +154,6 @@ pub fn load_account_delegated<H: Host + ?Sized>(
     let mut state_gas_cost = 0;
     let is_berlin = spec.is_enabled_in(SpecId::BERLIN);
     let is_spurious_dragon = spec.is_enabled_in(SpecId::SPURIOUS_DRAGON);
-    let is_eip7851_enabled = spec.is_enabled_in(SpecId::PRAGUE) && host.is_eip7851_enabled();
 
     let additional_cold_cost = host.gas_params().cold_account_additional_cost();
     let warm_storage_read_cost = host.gas_params().warm_storage_read_cost();
@@ -178,13 +177,10 @@ pub fn load_account_delegated<H: Host + ?Sized>(
     }
 
     let delegated_address = if spec.is_enabled_in(SpecId::PRAGUE) {
-        account.code.as_ref().and_then(|code| {
-            if is_eip7851_enabled {
-                code.delegated_address()
-            } else {
-                code.eip7702_address()
-            }
-        })
+        account
+            .code
+            .as_ref()
+            .and_then(|code| code.eip7702_address())
     } else {
         None
     };

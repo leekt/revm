@@ -652,10 +652,6 @@ opcodes! {
     0xF3 => RETURN       => stack_io(2, 0), terminating;
     0xF4 => DELEGATECALL => stack_io(6, 1);
     0xF5 => CREATE2      => stack_io(4, 1);
-    0xF6 => SETDELEGATE  => stack_io(2, 1);
-    // NON-NORMATIVE toolkit-local assignment: EIP-7851 leaves this opcode TBD,
-    // while 0xF6 is already occupied by the experimental EIP-7819 SETDELEGATE.
-    0xF7 => SETSELFDELEGATE => stack_io(1, 1);
     // 0xF8
     // 0xF9
     0xFA => STATICCALL      => stack_io(6, 1);
@@ -737,8 +733,8 @@ mod tests {
         for _ in OPCODE_INFO.into_iter().flatten() {
             opcode_num += 1;
         }
-        // 154 upstream, eleven frame opcodes, EIP-7819, and toolkit-local EIP-7851.
-        assert_eq!(opcode_num, 167);
+        // 154 upstream and eleven frame/fixture opcodes.
+        assert_eq!(opcode_num, 165);
     }
 
     #[test]
@@ -767,6 +763,12 @@ mod tests {
                 assert_eq!(OpCode::parse(op.as_str()), Some(op));
             }
         }
+    }
+
+    #[test]
+    fn declined_delegation_opcode_bytes_are_unassigned() {
+        assert!(OpCode::new(0xf6).is_none());
+        assert!(OpCode::new(0xf7).is_none());
     }
 
     #[test]
@@ -827,13 +829,5 @@ mod tests {
             assert_eq!(opcode.as_str(), name);
             assert_eq!(opcode.input_output(), (inputs, outputs));
         }
-    }
-
-    #[test]
-    fn setselfdelegate_metadata_uses_toolkit_local_assignment() {
-        assert_eq!(SETSELFDELEGATE, 0xF7);
-        let opcode = OpCode::new(SETSELFDELEGATE).unwrap();
-        assert_eq!(opcode.as_str(), "SETSELFDELEGATE");
-        assert_eq!(opcode.input_output(), (1, 1));
     }
 }

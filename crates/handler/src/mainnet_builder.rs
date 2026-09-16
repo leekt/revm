@@ -86,10 +86,7 @@ mod test {
     use alloy_signer::{Either, SignerSync};
     use alloy_signer_local::PrivateKeySigner;
     use bytecode::{
-        opcode::{
-            CALL, CALLDATALOAD, CREATE, GAS, MSTORE, POP, PUSH0, PUSH1, PUSH20, SETDELEGATE,
-            SSTORE, STOP,
-        },
+        opcode::{CREATE, POP, PUSH1, SSTORE, STOP},
         Bytecode,
     };
     use context::{
@@ -110,8 +107,8 @@ mod test {
         InterpreterResult,
     };
     use primitives::{
-        address, eip7819, hardfork::SpecId, Address, AddressSet, Bytes, Log, StorageKey,
-        StorageValue, TxKind, B256, U256,
+        address, hardfork::SpecId, Address, AddressSet, Bytes, Log, StorageKey, StorageValue,
+        TxKind, B256, U256,
     };
     use state::AccountInfo;
     use std::{cell::Cell, string::String, sync::Arc};
@@ -454,93 +451,6 @@ mod test {
                 .unwrap()
                 .present_value,
             StorageValue::from(1)
-        );
-    }
-
-    #[test]
-    fn setdelegate_is_effective_immediately_in_the_same_transaction() {
-        let caller = address!("1000000000000000000000000000000000000001");
-        let factory = address!("1000000000000000000000000000000000000002");
-        let target = address!("1000000000000000000000000000000000000003");
-        let location = eip7819::setdelegate_address(factory, U256::ZERO);
-        let implementation =
-            Bytecode::new_legacy([PUSH0, CALLDATALOAD, PUSH0, SSTORE, STOP].into());
-        let mut factory_code = vec![PUSH20];
-        factory_code.extend_from_slice(target.as_slice());
-        factory_code.extend_from_slice(&[
-            PUSH1,
-            0x00,
-            SETDELEGATE,
-            POP,
-            PUSH1,
-            0x2a,
-            PUSH0,
-            MSTORE,
-            PUSH0,
-            PUSH0,
-            PUSH1,
-            0x20,
-            PUSH0,
-            PUSH0,
-            PUSH20,
-        ]);
-        factory_code.extend_from_slice(location.as_slice());
-        factory_code.extend_from_slice(&[GAS, CALL, POP, STOP]);
-        let factory_code = Bytecode::new_legacy(factory_code.into());
-        let mut db = CacheDB::<EmptyDB>::default();
-        db.insert_account_info(
-            caller,
-            AccountInfo {
-                balance: U256::from(1_000_000_000u64),
-                ..Default::default()
-            },
-        );
-        db.insert_account_info(
-            factory,
-            AccountInfo {
-                nonce: 1,
-                code_hash: factory_code.hash_slow(),
-                code: Some(factory_code),
-                ..Default::default()
-            },
-        );
-        db.insert_account_info(
-            target,
-            AccountInfo {
-                nonce: 1,
-                code_hash: implementation.hash_slow(),
-                code: Some(implementation),
-                ..Default::default()
-            },
-        );
-        let ctx = Context::mainnet()
-            .modify_cfg_chained(|cfg| {
-                cfg.set_spec_and_mainnet_gas_params(SpecId::PRAGUE);
-                cfg.enable_eip7819 = true;
-            })
-            .with_db(db);
-        let mut evm = ctx.build_mainnet();
-
-        let output = evm.transact(matching_tx(caller, factory, 200_000)).unwrap();
-
-        assert!(matches!(output.result, ExecutionResult::Success { .. }));
-        let delegated = &output.state[&location];
-        assert_eq!(delegated.info.nonce, 1);
-        assert_eq!(
-            delegated.info.code.as_ref().unwrap().eip7702_address(),
-            Some(target)
-        );
-        assert_eq!(
-            delegated.storage[&StorageKey::ZERO].present_value,
-            StorageValue::from(0x2au64),
-            "the immediate call did not execute in the delegated account's storage context"
-        );
-        assert!(
-            output.state[&target]
-                .storage
-                .get(&StorageKey::ZERO)
-                .is_none_or(|slot| slot.present_value.is_zero()),
-            "the implementation account's storage was modified"
         );
     }
 

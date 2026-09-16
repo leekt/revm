@@ -28,13 +28,6 @@ where
         }
     }
 
-    fn is_eip7851_sender_ecdsa_authenticated(&self) -> bool {
-        match self {
-            Either::Left(l) => l.is_eip7851_sender_ecdsa_authenticated(),
-            Either::Right(r) => r.is_eip7851_sender_ecdsa_authenticated(),
-        }
-    }
-
     fn gas_limit(&self) -> u64 {
         match self {
             Either::Left(l) => l.gas_limit(),
